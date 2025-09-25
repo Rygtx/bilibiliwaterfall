@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili评论瀑布流
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      2.2.0
 // @description  在bilibili评论区实现瀑布流显示，点击"点击查看"时以弹出框形式展示所有子评论，支持按热度和时间排序
 // @author       You
 // @match        https://www.bilibili.com/video/*
@@ -471,7 +471,7 @@
             this.viewMoreButtons = new Set();
             this.onViewMoreClick = null;
             this.intervalId = null;
-            this.scanInterval = 2000;
+            this.scanInterval = 1000; // 增加扫描频率到1秒
         }
 
         observeCommentSection() {
@@ -480,8 +480,36 @@
                 return;
             }
 
-            this.observer = new MutationObserver(() => {
-                this.scanForViewMoreButtons();
+            this.observer = new MutationObserver((mutations) => {
+                let shouldRescan = false;
+
+                mutations.forEach((mutation) => {
+                    // 检查是否有节点被添加或移除
+                    if (mutation.type === 'childList') {
+                        // 检查是否涉及评论相关的DOM变化
+                        const hasCommentChanges = Array.from(mutation.addedNodes).some(node =>
+                            node.nodeType === Node.ELEMENT_NODE &&
+                            (node.tagName === 'BILI-COMMENT-THREAD-RENDERER' ||
+                             node.querySelector && node.querySelector('bili-comment-thread-renderer'))
+                        ) || Array.from(mutation.removedNodes).some(node =>
+                            node.nodeType === Node.ELEMENT_NODE &&
+                            (node.tagName === 'BILI-COMMENT-THREAD-RENDERER' ||
+                             node.querySelector && node.querySelector('bili-comment-thread-renderer'))
+                        );
+
+                        if (hasCommentChanges) {
+                            shouldRescan = true;
+                        }
+                    }
+                });
+
+                if (shouldRescan) {
+                    // 延迟一点时间让DOM完全更新
+                    setTimeout(() => {
+                        this.scanForViewMoreButtons();
+                        this.reattachMissingButtons();
+                    }, 100);
+                }
             });
 
             const targetNode = document.body;
@@ -496,7 +524,7 @@
 
             this.startPeriodicScan();
             this.scanForViewMoreButtons();
-            Utils.log('info', 'DOM监听器已启动');
+            Utils.log('info', 'DOM监听器已启动 - 增强版');
         }
 
         startPeriodicScan() {
@@ -506,9 +534,85 @@
 
             this.intervalId = setInterval(() => {
                 this.scanForViewMoreButtons();
+                this.reattachMissingButtons();
             }, this.scanInterval);
 
             Utils.log('info', `定时检测已启动，每 ${this.scanInterval}ms 检测一次`);
+        }
+
+        // 重新附加丢失的瀑布流按钮
+        reattachMissingButtons() {
+            try {
+                const commentApp = document.querySelector("#commentapp > bili-comments");
+                if (!commentApp || !commentApp.shadowRoot) return;
+
+                const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                let reattachedCount = 0;
+
+                threadRenderers.forEach((threadRenderer) => {
+                    if (!threadRenderer.shadowRoot) return;
+
+                    const repliesRenderer = threadRenderer.shadowRoot.querySelector("#replies > bili-comment-replies-renderer");
+                    if (!repliesRenderer || !repliesRenderer.shadowRoot) return;
+
+                    const viewMoreButton = repliesRenderer.shadowRoot.querySelector("#view-more > bili-text-button");
+                    if (!viewMoreButton || !viewMoreButton.shadowRoot) return;
+
+                    // 检查是否已有瀑布流按钮
+                    const existingWaterfallBtn = this.findWaterfallButton(threadRenderer);
+                    if (!existingWaterfallBtn) {
+                        // 如果没有瀑布流按钮，重新添加
+                        const button = viewMoreButton.shadowRoot.querySelector("button");
+                        if (button && this.viewMoreButtons.has(button)) {
+                            // 这个按钮之前已经处理过，但瀑布流按钮丢失了
+                            const commentInfo = this.extractCommentInfo(viewMoreButton, threadRenderer);
+                            if (commentInfo) {
+                                this.addWaterfallButtonToStableLocation(threadRenderer, commentInfo);
+                                reattachedCount++;
+                            }
+                        }
+                    }
+                });
+
+                if (reattachedCount > 0) {
+                    Utils.log('info', `重新附加了 ${reattachedCount} 个瀑布流按钮`);
+                }
+
+            } catch (error) {
+                Utils.log('error', '重新附加按钮时出错:', error);
+            }
+        }
+
+        // 查找瀑布流按钮
+        findWaterfallButton(threadRenderer) {
+            try {
+                // 在多个可能的位置查找瀑布流按钮
+                const possibleLocations = [
+                    threadRenderer,
+                    threadRenderer.shadowRoot?.querySelector("#replies"),
+                    threadRenderer.shadowRoot?.querySelector("#replies > bili-comment-replies-renderer"),
+                    threadRenderer.shadowRoot?.querySelector("#replies > bili-comment-replies-renderer")?.shadowRoot?.querySelector("#view-more")
+                ];
+
+                for (const location of possibleLocations) {
+                    if (location) {
+                        const waterfallBtn = location.querySelector?.('.bili-waterfall-btn');
+                        if (waterfallBtn) {
+                            return waterfallBtn;
+                        }
+                        // 也检查shadowRoot
+                        if (location.shadowRoot) {
+                            const waterfallBtn = location.shadowRoot.querySelector('.bili-waterfall-btn');
+                            if (waterfallBtn) {
+                                return waterfallBtn;
+                            }
+                        }
+                    }
+                }
+                return null;
+            } catch (error) {
+                return null;
+            }
         }
 
         scanForViewMoreButtons() {
@@ -565,24 +669,84 @@
                     container,
                     commentElement: threadRenderer
                 };
-                this.bindClickEvent(button, basicInfo);
-                this.addWaterfallButton(container, basicInfo);
-                Utils.log('info', '已处理"点击查看"按钮（无法提取完整信息）');
+                this.addWaterfallButtonToStableLocation(commentInfo.commentElement, basicInfo);
+                Utils.log('info', '已添加瀑布流按钮（无法提取完整信息）');
                 return;
             }
 
-            this.bindClickEvent(button, commentInfo);
-            this.addWaterfallButton(container, commentInfo);
-            Utils.log('info', `已处理"点击查看"按钮，评论ID: ${commentInfo.rootId}, 回复数: ${commentInfo.replyCount}`);
+            this.addWaterfallButtonToStableLocation(commentInfo.commentElement, commentInfo);
+            Utils.log('info', `已添加瀑布流按钮，评论ID: ${commentInfo.rootId}, 回复数: ${commentInfo.replyCount}`);
         }
 
-        addWaterfallButton(container, commentInfo) {
-            // 检查是否已经添加过瀑布流按钮
-            if (container.querySelector('.bili-waterfall-btn')) {
-                return;
-            }
+        // 将瀑布流按钮添加到稳定的位置
+        addWaterfallButtonToStableLocation(threadRenderer, commentInfo) {
+            try {
+                // 检查是否已经存在瀑布流按钮
+                if (this.findWaterfallButton(threadRenderer)) {
+                    return;
+                }
 
-            // 创建瀑布流按钮 - 暗色主题优化
+                // 寻找稳定的插入位置 - 评论主体区域
+                let targetContainer = null;
+
+                // 尝试多个可能的稳定位置
+                const possibleContainers = [
+                    // 1. 评论主体容器
+                    threadRenderer.shadowRoot?.querySelector("#body"),
+                    // 2. 评论内容区域
+                    threadRenderer.shadowRoot?.querySelector("#content"),
+                    // 3. 评论操作区域
+                    threadRenderer.shadowRoot?.querySelector("#toolbar"),
+                    // 4. 回复区域的父容器
+                    threadRenderer.shadowRoot?.querySelector("#replies")
+                ];
+
+                for (const container of possibleContainers) {
+                    if (container) {
+                        targetContainer = container;
+                        break;
+                    }
+                }
+
+                if (!targetContainer) {
+                    // 如果找不到稳定位置，使用threadRenderer本身
+                    targetContainer = threadRenderer;
+                }
+
+                // 创建瀑布流按钮
+                const waterfallBtn = this.createWaterfallButton(commentInfo);
+
+                // 创建一个包装容器，使按钮更稳定
+                const buttonWrapper = document.createElement('div');
+                buttonWrapper.className = 'bili-waterfall-wrapper';
+                buttonWrapper.style.cssText = `
+                    display: inline-block;
+                    margin: 4px 0;
+                    position: relative;
+                    z-index: 1000;
+                `;
+                buttonWrapper.appendChild(waterfallBtn);
+
+                // 将按钮添加到稳定位置
+                if (targetContainer.shadowRoot) {
+                    // 如果目标容器有shadowRoot，添加到shadowRoot中
+                    targetContainer.shadowRoot.appendChild(buttonWrapper);
+                } else {
+                    // 否则直接添加到容器中
+                    targetContainer.appendChild(buttonWrapper);
+                }
+
+                Utils.log('info', `瀑布流按钮已添加到稳定位置: ${targetContainer.tagName || 'unknown'}`);
+
+            } catch (error) {
+                Utils.log('error', '添加瀑布流按钮到稳定位置失败:', error);
+                // 降级到原始方法
+                this.addWaterfallButton(commentInfo.container || threadRenderer, commentInfo);
+            }
+        }
+
+        // 创建瀑布流按钮（提取为独立方法）
+        createWaterfallButton(commentInfo) {
             const waterfallBtn = document.createElement('button');
             waterfallBtn.className = 'bili-waterfall-btn';
             waterfallBtn.style.cssText = `
@@ -643,7 +807,17 @@
                 this.handleWaterfallClick(commentInfo);
             };
 
-            // 将按钮添加到容器中
+            return waterfallBtn;
+        }
+
+        // 原始的添加瀑布流按钮方法（作为降级选项）
+        addWaterfallButton(container, commentInfo) {
+            // 检查是否已经添加过瀑布流按钮
+            if (container.querySelector('.bili-waterfall-btn')) {
+                return;
+            }
+
+            const waterfallBtn = this.createWaterfallButton(commentInfo);
             container.appendChild(waterfallBtn);
         }
 
@@ -914,18 +1088,7 @@
             return null;
         }
 
-        bindClickEvent(button, commentInfo) {
-            button.addEventListener('click', (event) => {
-                event.preventDefault();
-                event.stopPropagation();
 
-                if (this.onViewMoreClick) {
-                    this.onViewMoreClick(commentInfo);
-                } else {
-                    Utils.log('warn', '未设置点击处理函数');
-                }
-            });
-        }
 
         setViewMoreClickHandler(handler) {
             this.onViewMoreClick = handler;
@@ -991,7 +1154,7 @@
 
         async handleViewMoreClick(commentInfo) {
             try {
-                Utils.log('info', '处理"点击查看"按钮点击', commentInfo);
+                Utils.log('info', '处理瀑布流按钮点击', commentInfo);
 
                 // 显示加载提示
                 this.showLoadingIndicator();
@@ -2081,6 +2244,42 @@
                             Utils.log('error', '测试真实评论失败:', error);
                             throw error;
                         }
+                    },
+                    // 测试瀑布流按钮持久性
+                    testButtonPersistence: () => {
+                        Utils.log('info', '=== 测试瀑布流按钮持久性 ===');
+
+                        const commentApp = document.querySelector("#commentapp > bili-comments");
+                        if (!commentApp || !commentApp.shadowRoot) {
+                            Utils.log('error', '未找到评论区');
+                            return;
+                        }
+
+                        const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                        Utils.log('info', `找到 ${threadRenderers.length} 个评论线程`);
+
+                        let buttonsFound = 0;
+                        let missingButtons = 0;
+
+                        threadRenderers.forEach((threadRenderer, index) => {
+                            const waterfallBtn = waterfallController.domWatcher.findWaterfallButton(threadRenderer);
+                            if (waterfallBtn) {
+                                buttonsFound++;
+                                Utils.log('info', `线程 ${index}: 瀑布流按钮存在`);
+                            } else {
+                                missingButtons++;
+                                Utils.log('warn', `线程 ${index}: 瀑布流按钮缺失`);
+                            }
+                        });
+
+                        Utils.log('info', `按钮统计: 存在 ${buttonsFound} 个，缺失 ${missingButtons} 个`);
+
+                        if (missingButtons > 0) {
+                            Utils.log('info', '尝试重新附加缺失的按钮...');
+                            waterfallController.domWatcher.reattachMissingButtons();
+                        }
+
+                        return { buttonsFound, missingButtons, total: threadRenderers.length };
                     }
                 };
 
@@ -2109,6 +2308,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论瀑布流脚本已加载，等待初始化...');
+    Utils.log('info', 'Bilibili评论瀑布流脚本 v2.2.0 已加载 - 增强DOM监听和按钮持久性');
 
 })();
