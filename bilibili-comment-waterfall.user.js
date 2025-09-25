@@ -579,24 +579,23 @@
             }
         }
 
-        // 查找瀑布流按钮
+        // 查找瀑布流按钮（优化版）
         findWaterfallButton(threadRenderer) {
             try {
-                // 在多个可能的位置查找瀑布流按钮
-                const possibleLocations = [
-                    threadRenderer,
+                // 优先在主要位置查找（基于实际使用情况优化）
+                const primaryLocations = [
                     threadRenderer.shadowRoot?.querySelector("#replies"),
-                    threadRenderer.shadowRoot?.querySelector("#replies > bili-comment-replies-renderer"),
-                    threadRenderer.shadowRoot?.querySelector("#replies > bili-comment-replies-renderer")?.shadowRoot?.querySelector("#view-more")
+                    threadRenderer
                 ];
 
-                for (const location of possibleLocations) {
+                for (const location of primaryLocations) {
                     if (location) {
+                        // 直接查找按钮
                         const waterfallBtn = location.querySelector?.('.bili-waterfall-btn');
                         if (waterfallBtn) {
                             return waterfallBtn;
                         }
-                        // 也检查shadowRoot
+                        // 检查shadowRoot
                         if (location.shadowRoot) {
                             const waterfallBtn = location.shadowRoot.querySelector('.bili-waterfall-btn');
                             if (waterfallBtn) {
@@ -676,7 +675,7 @@
             Utils.log('info', `已添加瀑布流按钮，评论ID: ${commentInfo.rootId}, 回复数: ${commentInfo.replyCount}`);
         }
 
-        // 将瀑布流按钮添加到稳定的位置
+        // 将瀑布流按钮添加到稳定的位置（优化版）
         addWaterfallButtonToStableLocation(threadRenderer, commentInfo) {
             try {
                 // 检查是否已经存在瀑布流按钮
@@ -685,31 +684,15 @@
                     return;
                 }
 
-                // 寻找稳定的插入位置 - 评论主体区域
-                let targetContainer = null;
-                Utils.log('info', '开始查找稳定的容器位置...');
+                // 直接使用已验证有效的容器选择器
+                let targetContainer = threadRenderer.shadowRoot?.querySelector("#replies");
 
-                // 尝试多个可能的稳定位置
-                const possibleContainers = [
-                    { name: '#body', element: threadRenderer.shadowRoot?.querySelector("#body") },
-                    { name: '#content', element: threadRenderer.shadowRoot?.querySelector("#content") },
-                    { name: '#toolbar', element: threadRenderer.shadowRoot?.querySelector("#toolbar") },
-                    { name: '#replies', element: threadRenderer.shadowRoot?.querySelector("#replies") }
-                ];
-
-                for (const container of possibleContainers) {
-                    Utils.log('info', `尝试容器 ${container.name}: ${container.element ? '找到' : '未找到'}`);
-                    if (container.element) {
-                        targetContainer = container.element;
-                        Utils.log('info', `选择容器: ${container.name}`);
-                        break;
-                    }
-                }
-
-                if (!targetContainer) {
-                    // 如果找不到稳定位置，使用threadRenderer本身
+                if (targetContainer) {
+                    Utils.log('info', '使用主要容器: #replies');
+                } else {
+                    // 降级方案：使用threadRenderer本身
                     targetContainer = threadRenderer;
-                    Utils.log('warn', '未找到稳定容器，使用threadRenderer作为降级方案');
+                    Utils.log('warn', '未找到#replies容器，使用threadRenderer作为降级方案');
                 }
 
                 // 创建瀑布流按钮
