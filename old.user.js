@@ -23,7 +23,6 @@
 
     // 工具函数
     const Utils = {
-        // 调试日志输出功能
         log(level, message, ...args) {
             const timestamp = new Date().toISOString();
             const prefix = `[Bilibili瀑布流 ${timestamp}]`;
@@ -147,6 +146,7 @@
 
                 throw new Error('API返回错误');
             } catch (error) {
+                Utils.log('warn', `获取视频标题失败: ${error.message}`);
                 return null;
             }
         },
@@ -321,6 +321,8 @@
 
                     return response;
                 } catch (error) {
+                    Utils.log('warn', `请求失败 (尝试 ${i + 1}/${retries}):`, error.message);
+
                     if (i === retries - 1) {
                         throw error;
                     }
@@ -364,6 +366,7 @@
                 url.searchParams.set('pn', page);
 
                 Utils.log('info', `请求评论回复: ${url.toString()}`);
+
                 const response = await Utils.fetchWithRetry(url.toString());
                 const data = await response.json();
 
@@ -449,6 +452,7 @@
                 return data.data;
 
             } catch (error) {
+                Utils.log('error', '获取评论信息失败:', error);
                 throw error;
             }
         }
@@ -615,12 +619,10 @@
             try {
                 const commentApp = document.querySelector("#commentapp > bili-comments");
                 if (!commentApp || !commentApp.shadowRoot) {
-                    Utils.log('warn', '未找到评论区或shadowRoot');
                     return;
                 }
 
                 const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
-                Utils.log('info', `扫描评论区: 找到 ${threadRenderers.length} 个评论线程`);
                 let newButtonsFound = 0;
 
                 threadRenderers.forEach((threadRenderer) => {
@@ -681,27 +683,27 @@
             try {
                 // 检查是否已经存在瀑布流按钮
                 if (this.findWaterfallButton(threadRenderer)) {
-                    Utils.log('info', '瀑布流按钮已存在，跳过添加');
                     return;
                 }
 
                 // 寻找稳定的插入位置 - 评论主体区域
                 let targetContainer = null;
-                Utils.log('info', '开始查找稳定的容器位置...');
 
                 // 尝试多个可能的稳定位置
                 const possibleContainers = [
-                    { name: '#body', element: threadRenderer.shadowRoot?.querySelector("#body") },
-                    { name: '#content', element: threadRenderer.shadowRoot?.querySelector("#content") },
-                    { name: '#toolbar', element: threadRenderer.shadowRoot?.querySelector("#toolbar") },
-                    { name: '#replies', element: threadRenderer.shadowRoot?.querySelector("#replies") }
+                    // 1. 评论主体容器
+                    threadRenderer.shadowRoot?.querySelector("#body"),
+                    // 2. 评论内容区域
+                    threadRenderer.shadowRoot?.querySelector("#content"),
+                    // 3. 评论操作区域
+                    threadRenderer.shadowRoot?.querySelector("#toolbar"),
+                    // 4. 回复区域的父容器
+                    threadRenderer.shadowRoot?.querySelector("#replies")
                 ];
 
                 for (const container of possibleContainers) {
-                    Utils.log('info', `尝试容器 ${container.name}: ${container.element ? '找到' : '未找到'}`);
-                    if (container.element) {
-                        targetContainer = container.element;
-                        Utils.log('info', `选择容器: ${container.name}`);
+                    if (container) {
+                        targetContainer = container;
                         break;
                     }
                 }
@@ -709,7 +711,6 @@
                 if (!targetContainer) {
                     // 如果找不到稳定位置，使用threadRenderer本身
                     targetContainer = threadRenderer;
-                    Utils.log('warn', '未找到稳定容器，使用threadRenderer作为降级方案');
                 }
 
                 // 创建瀑布流按钮
@@ -730,16 +731,15 @@
                 if (targetContainer.shadowRoot) {
                     // 如果目标容器有shadowRoot，添加到shadowRoot中
                     targetContainer.shadowRoot.appendChild(buttonWrapper);
-                    Utils.log('info', `瀑布流按钮已添加到稳定位置(shadowRoot): ${targetContainer.tagName || 'unknown'}`);
                 } else {
                     // 否则直接添加到容器中
                     targetContainer.appendChild(buttonWrapper);
-                    Utils.log('info', `瀑布流按钮已添加到稳定位置: ${targetContainer.tagName || 'unknown'}`);
                 }
+
+                Utils.log('info', `瀑布流按钮已添加到稳定位置: ${targetContainer.tagName || 'unknown'}`);
 
             } catch (error) {
                 Utils.log('error', '添加瀑布流按钮到稳定位置失败:', error);
-                Utils.log('info', '尝试使用降级方案...');
                 // 降级到原始方法
                 this.addWaterfallButton(commentInfo.container || threadRenderer, commentInfo);
             }
@@ -842,7 +842,8 @@
                 Utils.log('info', `提取到的信息: rootId=${rootId}, oid=${oid}, replyCount=${replyCount}`);
 
                 if (!rootId) {
-                    Utils.log('warn', '无法提取评论ID');
+                    Utils.log('warn', '无法提取评论ID，尝试调试信息');
+                    this.debugCommentStructure(threadRenderer);
                     return null;
                 }
 
@@ -928,7 +929,32 @@
             return null;
         }
 
+        debugCommentStructure(threadRenderer) {
+            Utils.log('info', '=== 调试评论结构 ===');
+            Utils.log('info', 'threadRenderer attributes:', Array.from(threadRenderer.attributes).map(attr => `${attr.name}="${attr.value}"`));
 
+            if (threadRenderer.shadowRoot) {
+                Utils.log('info', 'shadowRoot存在');
+                const commentRenderer = threadRenderer.shadowRoot.querySelector('bili-comment-renderer');
+                if (commentRenderer) {
+                    Utils.log('info', 'commentRenderer attributes:', Array.from(commentRenderer.attributes).map(attr => `${attr.name}="${attr.value}"`));
+                }
+
+                const allElements = threadRenderer.shadowRoot.querySelectorAll('*');
+                Utils.log('info', `shadowRoot中共有 ${allElements.length} 个元素`);
+
+                // 查找所有有属性的元素
+                allElements.forEach((el, index) => {
+                    if (el.attributes.length > 0) {
+                        const attrs = Array.from(el.attributes).map(attr => `${attr.name}="${attr.value}"`);
+                        Utils.log('info', `元素${index} (${el.tagName}):`, attrs);
+                    }
+                });
+            } else {
+                Utils.log('info', 'shadowRoot不存在');
+            }
+            Utils.log('info', '=== 调试结束 ===');
+        }
 
         extractIdFromComponent(component) {
             // 尝试从组件本身的属性获取
@@ -977,7 +1003,7 @@
                     }
                 }
             } catch (error) {
-                // 静默处理错误
+                Utils.log('warn', '从链接提取ID失败', error);
             }
 
             return null;
@@ -991,9 +1017,11 @@
             if (match) {
                 if (match[1]) {
                     // av号直接返回
+                    Utils.log('info', `从URL提取到av号: ${match[1]}`);
                     return match[1];
                 } else if (match[2]) {
                     // BV号需要转换，但先尝试从页面数据获取对应的aid
+                    Utils.log('info', `从URL提取到BV号: ${match[2]}`);
                     const aid = this.getAidFromPageData();
                     if (aid) {
                         return aid;
@@ -1014,10 +1042,12 @@
             if (metaAid) {
                 const metaMatch = metaAid.content.match(/\/video\/av(\d+)/);
                 if (metaMatch) {
+                    Utils.log('info', `从meta标签提取到aid: ${metaMatch[1]}`);
                     return metaMatch[1];
                 }
             }
 
+            Utils.log('warn', '无法提取视频ID');
             return null;
         }
 
@@ -1047,11 +1077,12 @@
                 for (const source of sources) {
                     const aid = source();
                     if (aid) {
+                        Utils.log('info', `从页面数据获取到aid: ${aid}`);
                         return aid.toString();
                     }
                 }
             } catch (error) {
-                // 静默处理错误
+                Utils.log('warn', '从页面数据获取视频ID失败', error);
             }
 
             return null;
@@ -1100,6 +1131,7 @@
 
             try {
                 Utils.log('info', '开始初始化Bilibili评论瀑布流脚本');
+
                 this.setupEventHandlers();
                 this.domWatcher.observeCommentSection();
 
@@ -1116,6 +1148,7 @@
             this.domWatcher.setViewMoreClickHandler((commentInfo) => {
                 this.handleViewMoreClick(commentInfo);
             });
+
             Utils.log('info', '事件处理函数已设置');
         }
 
@@ -1677,7 +1710,8 @@
                 messageDiv.innerHTML = processedContent;
                 // 为增强版视频链接添加悬停效果
                 Utils.addEnhancedVideoLinkHoverEffects(messageDiv);
-            }).catch(() => {
+            }).catch(error => {
+                Utils.log('warn', `处理视频链接失败: ${error.message}`);
                 // 如果失败，使用简单版本
                 const simpleProcessed = Utils.processCommentContent(originalContent);
                 messageDiv.innerHTML = simpleProcessed;
@@ -1769,12 +1803,489 @@
                 window.bilibiliWaterfall = {
                     controller: waterfallController,
                     getStatus: () => waterfallController.getStatus(),
-                    destroy: () => waterfallController.destroy()
+                    destroy: () => waterfallController.destroy(),
+                    testAPI: async (oid, rootId) => {
+                        try {
+                            Utils.log('info', `测试API调用: oid=${oid}, rootId=${rootId}`);
+                            const replies = await waterfallController.commentAPI.getAllReplies(oid, rootId);
+                            Utils.log('info', `测试成功，获取到 ${replies.length} 条回复`);
+                            console.log('回复数据:', replies);
+                            return replies;
+                        } catch (error) {
+                            Utils.log('error', '测试API调用失败:', error);
+                            throw error;
+                        }
+                    },
+                    extractIds: () => {
+                        const oid = waterfallController.domWatcher.extractVideoId();
+                        Utils.log('info', `当前视频ID: ${oid}`);
+                        return { oid };
+                    },
+                    findRealComments: () => {
+                        const comments = [];
+                        try {
+                            const commentApp = document.querySelector("#commentapp > bili-comments");
+                            if (!commentApp || !commentApp.shadowRoot) {
+                                Utils.log('warn', '未找到评论区');
+                                return comments;
+                            }
+
+                            const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                            Utils.log('info', `找到 ${threadRenderers.length} 个评论线程`);
+
+                            threadRenderers.forEach((threadRenderer, index) => {
+                                if (!threadRenderer.shadowRoot) return;
+
+                                // 尝试提取评论ID
+                                const rpid = waterfallController.domWatcher.extractCommentId(threadRenderer);
+
+                                // 检查是否有回复 - 从__data中获取回复数量
+                                let replyCount = 0;
+                                let hasReplies = false;
+                                let viewMoreButton = null;
+
+                                // 方法1: 从__data获取回复数量
+                                if (threadRenderer.__data && threadRenderer.__data.rcount) {
+                                    replyCount = threadRenderer.__data.rcount;
+                                    hasReplies = replyCount > 0;
+                                }
+
+                                // 方法2: 检查回复按钮
+                                const repliesRenderer = threadRenderer.shadowRoot.querySelector("#replies > bili-comment-replies-renderer");
+                                if (repliesRenderer && repliesRenderer.shadowRoot) {
+                                    viewMoreButton = repliesRenderer.shadowRoot.querySelector("#view-more > bili-text-button");
+                                    if (viewMoreButton) {
+                                        hasReplies = true;
+                                        const buttonText = viewMoreButton.textContent || '';
+                                        const match = buttonText.match(/(\d+)\s*条回复/);
+                                        if (match) {
+                                            const buttonReplyCount = parseInt(match[1], 10);
+                                            // 如果按钮中的数量更大，使用按钮中的数量
+                                            if (buttonReplyCount > replyCount) {
+                                                replyCount = buttonReplyCount;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                comments.push({
+                                    index,
+                                    rpid,
+                                    hasReplies: hasReplies,
+                                    replyCount,
+                                    buttonText: viewMoreButton?.textContent || '无回复按钮',
+                                    dataReplyCount: threadRenderer.__data?.rcount || 0
+                                });
+                            });
+
+                            Utils.log('info', '找到的评论信息:', comments);
+                            return comments;
+                        } catch (error) {
+                            Utils.log('error', '查找评论失败:', error);
+                            return comments;
+                        }
+                    },
+                    debugFirstComment: () => {
+                        try {
+                            const commentApp = document.querySelector("#commentapp > bili-comments");
+                            if (!commentApp || !commentApp.shadowRoot) {
+                                Utils.log('warn', '未找到评论区');
+                                return;
+                            }
+
+                            const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                            if (threadRenderers.length === 0) {
+                                Utils.log('warn', '未找到评论线程');
+                                return;
+                            }
+
+                            const firstThread = threadRenderers[0];
+                            Utils.log('info', '=== 调试第一个评论的完整结构 ===');
+
+                            // 输出threadRenderer的所有属性
+                            Utils.log('info', 'threadRenderer标签名:', firstThread.tagName);
+                            Utils.log('info', 'threadRenderer属性:', Array.from(firstThread.attributes).map(attr => `${attr.name}="${attr.value}"`));
+
+                            // 检查shadowRoot
+                            if (firstThread.shadowRoot) {
+                                Utils.log('info', 'shadowRoot存在');
+
+                                // 查找所有子元素
+                                const allElements = firstThread.shadowRoot.querySelectorAll('*');
+                                Utils.log('info', `shadowRoot中共有 ${allElements.length} 个元素`);
+
+                                // 输出前20个有属性的元素
+                                let count = 0;
+                                allElements.forEach((el, index) => {
+                                    if (el.attributes.length > 0 && count < 20) {
+                                        const attrs = Array.from(el.attributes).map(attr => `${attr.name}="${attr.value}"`);
+                                        Utils.log('info', `元素${index} (${el.tagName}):`, attrs.join(', '));
+                                        count++;
+                                    }
+                                });
+
+                                // 特别查找可能包含ID的元素
+                                const possibleIdElements = firstThread.shadowRoot.querySelectorAll('[id], [data-id], [data-rpid], [rpid], [comment-id]');
+                                Utils.log('info', `找到 ${possibleIdElements.length} 个可能包含ID的元素:`);
+                                possibleIdElements.forEach((el, index) => {
+                                    const attrs = Array.from(el.attributes).map(attr => `${attr.name}="${attr.value}"`);
+                                    Utils.log('info', `ID元素${index} (${el.tagName}):`, attrs.join(', '));
+                                });
+
+                                // 查找bili-comment-renderer
+                                const commentRenderer = firstThread.shadowRoot.querySelector('bili-comment-renderer');
+                                if (commentRenderer) {
+                                    Utils.log('info', 'bili-comment-renderer存在');
+                                    Utils.log('info', 'bili-comment-renderer属性:', Array.from(commentRenderer.attributes).map(attr => `${attr.name}="${attr.value}"`));
+
+                                    if (commentRenderer.shadowRoot) {
+                                        Utils.log('info', 'bili-comment-renderer也有shadowRoot');
+                                        const rendererElements = commentRenderer.shadowRoot.querySelectorAll('[id], [data-id], [data-rpid], [rpid]');
+                                        Utils.log('info', `renderer shadowRoot中找到 ${rendererElements.length} 个可能包含ID的元素:`);
+                                        rendererElements.forEach((el, index) => {
+                                            const attrs = Array.from(el.attributes).map(attr => `${attr.name}="${attr.value}"`);
+                                            Utils.log('info', `Renderer ID元素${index} (${el.tagName}):`, attrs.join(', '));
+                                        });
+                                    }
+                                } else {
+                                    Utils.log('warn', 'bili-comment-renderer不存在');
+                                }
+
+                            } else {
+                                Utils.log('warn', 'shadowRoot不存在');
+                            }
+
+                            Utils.log('info', '=== 调试结束 ===');
+
+                        } catch (error) {
+                            Utils.log('error', '调试第一个评论失败:', error);
+                        }
+                    },
+                    deepDebugComment: () => {
+                        try {
+                            const commentApp = document.querySelector("#commentapp > bili-comments");
+                            if (!commentApp || !commentApp.shadowRoot) {
+                                Utils.log('warn', '未找到评论区');
+                                return;
+                            }
+
+                            const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                            if (threadRenderers.length === 0) {
+                                Utils.log('warn', '未找到评论线程');
+                                return;
+                            }
+
+                            const firstThread = threadRenderers[0];
+                            Utils.log('info', '=== 深度调试评论数据 ===');
+
+                            // 检查threadRenderer的所有属性和数据
+                            Utils.log('info', 'threadRenderer.dataset:', firstThread.dataset);
+
+                            // 检查是否有内部数据
+                            if (firstThread.__data) {
+                                Utils.log('info', 'threadRenderer.__data:', firstThread.__data);
+                            }
+
+                            // 检查所有可能的属性
+                            for (let prop in firstThread) {
+                                if (typeof firstThread[prop] !== 'function' && prop.includes('id') || prop.includes('rpid') || prop.includes('comment')) {
+                                    Utils.log('info', `threadRenderer.${prop}:`, firstThread[prop]);
+                                }
+                            }
+
+                            if (firstThread.shadowRoot) {
+                                const commentRenderer = firstThread.shadowRoot.querySelector('bili-comment-renderer');
+                                if (commentRenderer) {
+                                    Utils.log('info', '=== bili-comment-renderer 深度分析 ===');
+
+                                    // 检查所有属性
+                                    Utils.log('info', 'commentRenderer.dataset:', commentRenderer.dataset);
+
+                                    // 检查内部数据
+                                    if (commentRenderer.__data) {
+                                        Utils.log('info', 'commentRenderer.__data:', commentRenderer.__data);
+                                    }
+
+                                    // 检查所有可能包含ID的属性
+                                    for (let prop in commentRenderer) {
+                                        if (typeof commentRenderer[prop] !== 'function' && (prop.includes('id') || prop.includes('rpid') || prop.includes('comment') || prop.includes('data'))) {
+                                            Utils.log('info', `commentRenderer.${prop}:`, commentRenderer[prop]);
+                                        }
+                                    }
+
+                                    // 检查commentRenderer的shadowRoot
+                                    if (commentRenderer.shadowRoot) {
+                                        Utils.log('info', '=== commentRenderer shadowRoot 分析 ===');
+
+                                        // 查找所有可能包含数据的元素
+                                        const allElements = commentRenderer.shadowRoot.querySelectorAll('*');
+                                        allElements.forEach((el, index) => {
+                                            // 检查元素的所有属性
+                                            const attrs = Array.from(el.attributes);
+                                            const dataAttrs = attrs.filter(attr =>
+                                                attr.name.includes('data-') ||
+                                                attr.name.includes('id') ||
+                                                attr.name.includes('rpid') ||
+                                                attr.value.match(/^\d+$/) // 纯数字值
+                                            );
+
+                                            if (dataAttrs.length > 0) {
+                                                Utils.log('info', `元素${index} (${el.tagName}) 数据属性:`,
+                                                    dataAttrs.map(attr => `${attr.name}="${attr.value}"`).join(', '));
+                                            }
+
+                                            // 检查元素的dataset
+                                            if (Object.keys(el.dataset).length > 0) {
+                                                Utils.log('info', `元素${index} (${el.tagName}) dataset:`, el.dataset);
+                                            }
+
+                                            // 检查元素的内部数据
+                                            if (el.__data) {
+                                                Utils.log('info', `元素${index} (${el.tagName}) __data:`, el.__data);
+                                            }
+                                        });
+
+                                        // 特别检查可能包含评论数据的脚本或JSON
+                                        const scripts = commentRenderer.shadowRoot.querySelectorAll('script');
+                                        scripts.forEach((script, index) => {
+                                            if (script.textContent && script.textContent.includes('rpid')) {
+                                                Utils.log('info', `脚本${index}包含rpid:`, script.textContent.substring(0, 500));
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+
+                            Utils.log('info', '=== 深度调试结束 ===');
+
+                        } catch (error) {
+                            Utils.log('error', '深度调试失败:', error);
+                        }
+                    },
+                    monitorNetworkRequests: () => {
+                        Utils.log('info', '开始监听网络请求...');
+
+                        // 保存原始的fetch函数
+                        const originalFetch = window.fetch;
+
+                        // 重写fetch函数
+                        window.fetch = function(...args) {
+                            const url = args[0];
+                            if (typeof url === 'string' && url.includes('reply')) {
+                                Utils.log('info', '捕获到评论相关请求:', url);
+                            }
+                            return originalFetch.apply(this, args);
+                        };
+
+                        // 监听XMLHttpRequest
+                        const originalXHROpen = XMLHttpRequest.prototype.open;
+                        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                            if (typeof url === 'string' && url.includes('reply')) {
+                                Utils.log('info', '捕获到XHR评论请求:', url);
+                            }
+                            return originalXHROpen.apply(this, [method, url, ...rest]);
+                        };
+
+                        Utils.log('info', '网络监听已启动，请点击"点击查看"按钮触发请求');
+
+                        // 5分钟后恢复原始函数
+                        setTimeout(() => {
+                            window.fetch = originalFetch;
+                            XMLHttpRequest.prototype.open = originalXHROpen;
+                            Utils.log('info', '网络监听已停止');
+                        }, 300000);
+                    },
+                    testFixedExtraction: () => {
+                        try {
+                            const commentApp = document.querySelector("#commentapp > bili-comments");
+                            if (!commentApp || !commentApp.shadowRoot) {
+                                Utils.log('warn', '未找到评论区');
+                                return;
+                            }
+
+                            const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                            Utils.log('info', `找到 ${threadRenderers.length} 个评论线程`);
+
+                            const results = [];
+                            threadRenderers.forEach((threadRenderer, index) => {
+                                if (index < 5) { // 只测试前5个
+                                    const rpid = waterfallController.domWatcher.extractCommentId(threadRenderer);
+                                    const oid = waterfallController.domWatcher.extractVideoId();
+
+                                    results.push({
+                                        index,
+                                        rpid,
+                                        oid,
+                                        success: !!rpid
+                                    });
+                                }
+                            });
+
+                            Utils.log('info', '修复后的提取结果:', results);
+
+                            const successCount = results.filter(r => r.success).length;
+                            Utils.log('info', `成功提取 ${successCount}/${results.length} 个评论ID`);
+
+                            return results;
+                        } catch (error) {
+                            Utils.log('error', '测试修复后的提取失败:', error);
+                        }
+                    },
+                    testVideoLinkProcessing: () => {
+                        const testTexts = [
+                            '推荐看看av123456这个视频',
+                            '这个BV1xx411c7mD很好看',
+                            '看看av2和BV1xx411c7mD这两个视频',
+                            '普通文本没有视频链接',
+                            'av123456 BV1xx411c7mD 混合测试'
+                        ];
+
+                        Utils.log('info', '=== 测试视频链接识别功能 ===');
+                        testTexts.forEach((text, index) => {
+                            const processed = Utils.processCommentContent(text);
+                            Utils.log('info', `测试${index + 1}:`);
+                            Utils.log('info', `原文: ${text}`);
+                            Utils.log('info', `处理后: ${processed}`);
+                            Utils.log('info', '---');
+                        });
+                        Utils.log('info', '=== 测试完成 ===');
+                    },
+                    testSortingFeature: () => {
+                        Utils.log('info', '=== 测试排序功能 ===');
+
+                        // 模拟评论数据
+                        const mockReplies = [
+                            { ctime: 1640995200, like: 100, content: { message: '最早的评论，高赞' } },
+                            { ctime: 1672531200, like: 50, content: { message: '中间的评论，中赞' } },
+                            { ctime: 1704067200, like: 200, content: { message: '最新的评论，最高赞' } },
+                            { ctime: 1656633600, like: 10, content: { message: '中等时间，低赞' } }
+                        ];
+
+                        Utils.log('info', '原始数据:');
+                        mockReplies.forEach((reply, index) => {
+                            const date = new Date(reply.ctime * 1000).toLocaleDateString();
+                            Utils.log('info', `${index + 1}. ${date} - 赞数:${reply.like} - ${reply.content.message}`);
+                        });
+
+                        // 测试按热度排序
+                        const hotSorted = [...mockReplies].sort((a, b) => (b.like || 0) - (a.like || 0));
+                        Utils.log('info', '按热度排序:');
+                        hotSorted.forEach((reply, index) => {
+                            Utils.log('info', `${index + 1}. 赞数:${reply.like} - ${reply.content.message}`);
+                        });
+
+                        // 测试按时间倒序排序
+                        const timeDescSorted = [...mockReplies].sort((a, b) => (b.ctime || 0) - (a.ctime || 0));
+                        Utils.log('info', '按时间倒序排序（最新在前）:');
+                        timeDescSorted.forEach((reply, index) => {
+                            const date = new Date(reply.ctime * 1000).toLocaleDateString();
+                            Utils.log('info', `${index + 1}. ${date} - ${reply.content.message}`);
+                        });
+
+                        // 测试按时间正序排序
+                        const timeAscSorted = [...mockReplies].sort((a, b) => (a.ctime || 0) - (b.ctime || 0));
+                        Utils.log('info', '按时间正序排序（最旧在前）:');
+                        timeAscSorted.forEach((reply, index) => {
+                            const date = new Date(reply.ctime * 1000).toLocaleDateString();
+                            Utils.log('info', `${index + 1}. ${date} - ${reply.content.message}`);
+                        });
+
+                        Utils.log('info', '=== 排序功能测试完成 ===');
+                    },
+                    testEnhancedVideoLinks: async () => {
+                        Utils.log('info', '=== 测试增强版视频链接功能 ===');
+
+                        const testTexts = [
+                            '推荐看看av123456这个视频',
+                            '这个BV1xx411c7mD很好看',
+                            '看看av2和BV1xx411c7mD这两个视频',
+                            '普通文本没有视频链接',
+                            'av123456 BV1xx411c7mD 混合测试'
+                        ];
+
+                        for (const text of testTexts) {
+                            Utils.log('info', `原文: ${text}`);
+                            try {
+                                const processed = await Utils.processCommentContentEnhanced(text);
+                                Utils.log('info', `处理后: ${processed}`);
+                            } catch (error) {
+                                Utils.log('error', `处理失败: ${error.message}`);
+                            }
+                            Utils.log('info', '---');
+                        }
+
+                        Utils.log('info', '=== 增强版视频链接测试完成 ===');
+                    },
+                    testRealComment: async () => {
+                        const comments = window.bilibiliWaterfall.findRealComments();
+                        const oid = waterfallController.domWatcher.extractVideoId();
+
+                        if (!oid) {
+                            Utils.log('error', '无法获取视频ID');
+                            return;
+                        }
+
+                        // 找到第一个有回复的评论
+                        const commentWithReplies = comments.find(c => c.hasReplies && c.rpid && c.replyCount > 0);
+
+                        if (!commentWithReplies) {
+                            Utils.log('warn', '当前页面没有找到有回复的评论');
+                            return;
+                        }
+
+                        Utils.log('info', `测试真实评论: rpid=${commentWithReplies.rpid}, 预期回复数=${commentWithReplies.replyCount}`);
+
+                        try {
+                            const replies = await waterfallController.commentAPI.getAllReplies(oid, commentWithReplies.rpid);
+                            Utils.log('info', `✅ 测试成功！获取到 ${replies.length} 条真实回复`);
+                            console.log('回复数据示例:', replies.slice(0, 3));
+                            return replies;
+                        } catch (error) {
+                            Utils.log('error', '测试真实评论失败:', error);
+                            throw error;
+                        }
+                    },
+                    // 测试瀑布流按钮持久性
+                    testButtonPersistence: () => {
+                        Utils.log('info', '=== 测试瀑布流按钮持久性 ===');
+
+                        const commentApp = document.querySelector("#commentapp > bili-comments");
+                        if (!commentApp || !commentApp.shadowRoot) {
+                            Utils.log('error', '未找到评论区');
+                            return;
+                        }
+
+                        const threadRenderers = commentApp.shadowRoot.querySelectorAll("#feed > bili-comment-thread-renderer");
+                        Utils.log('info', `找到 ${threadRenderers.length} 个评论线程`);
+
+                        let buttonsFound = 0;
+                        let missingButtons = 0;
+
+                        threadRenderers.forEach((threadRenderer, index) => {
+                            const waterfallBtn = waterfallController.domWatcher.findWaterfallButton(threadRenderer);
+                            if (waterfallBtn) {
+                                buttonsFound++;
+                                Utils.log('info', `线程 ${index}: 瀑布流按钮存在`);
+                            } else {
+                                missingButtons++;
+                                Utils.log('warn', `线程 ${index}: 瀑布流按钮缺失`);
+                            }
+                        });
+
+                        Utils.log('info', `按钮统计: 存在 ${buttonsFound} 个，缺失 ${missingButtons} 个`);
+
+                        if (missingButtons > 0) {
+                            Utils.log('info', '尝试重新附加缺失的按钮...');
+                            waterfallController.domWatcher.reattachMissingButtons();
+                        }
+
+                        return { buttonsFound, missingButtons, total: threadRenderers.length };
+                    }
                 };
 
                 Utils.log('info', '全局调试接口已添加: window.bilibiliWaterfall');
 
-            }).catch((error) => {
+            }).catch(error => {
                 Utils.log('error', '脚本初始化失败', error);
             });
 
