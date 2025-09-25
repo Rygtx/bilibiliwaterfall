@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    http://tampermonkey.net/
-// @version      2.3.0
+// @version      2.3.1
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，提供流畅的评论浏览体验
-// @author       You
+// @author       Rygtx
+// @icon         https://www.bilibili.com/favicon.ico
 // @match        https://www.bilibili.com/video/*
 // @grant        none
 // @run-at       document-end
