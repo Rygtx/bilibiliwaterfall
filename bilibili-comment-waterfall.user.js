@@ -7,6 +7,7 @@
 // @icon         https://www.bilibili.com/favicon.ico
 // @match        https://www.bilibili.com/video/*
 // @grant        none
+// @license CC BY-NC 4.0
 // @run-at       document-end
 // ==/UserScript==
 
