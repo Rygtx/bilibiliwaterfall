@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    http://tampermonkey.net/
-// @version      2.3.1
-// @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，提供流畅的评论浏览体验
+// @version      2.4.0
+// @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
 // @match        https://www.bilibili.com/video/*
 // @grant        none
-// @license CC BY-NC 4.0
+// @license      CC-BY-NC-4.0
 // @run-at       document-end
 // ==/UserScript==
 
@@ -94,6 +94,106 @@
             return div.innerHTML;
         },
 
+        // B站表情符号缓存 - 会话级缓存
+        emoticonCache: null,
+        emoticonCacheTime: null,
+        emoticonCacheExpiry: 30 * 60 * 1000, // 30分钟缓存过期时间
+
+        // 动态获取B站表情符号映射表
+        async fetchEmoticonMap() {
+            const now = Date.now();
+
+            // 检查缓存是否有效
+            if (this.emoticonCache && this.emoticonCacheTime &&
+                (now - this.emoticonCacheTime) < this.emoticonCacheExpiry) {
+                this.log('info', '使用缓存的表情符号数据');
+                return this.emoticonCache;
+            }
+
+            try {
+                this.log('info', '正在获取B站表情符号数据...');
+                const response = await fetch('https://api.bilibili.com/x/emote/user/panel/web?business=reply');
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+
+                const data = await response.json();
+
+                if (data.code !== 0) {
+                    throw new Error(`API错误: ${data.message || '未知错误'}`);
+                }
+
+                // 解析表情数据
+                const emoticonMap = {};
+                let totalEmoticons = 0;
+
+                if (data.data && data.data.packages) {
+                    for (const package of data.data.packages) {
+                        if (package.emote && Array.isArray(package.emote)) {
+                            for (const emote of package.emote) {
+                                if (emote.text && emote.url) {
+                                    emoticonMap[emote.text] = emote.url;
+                                    totalEmoticons++;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 更新缓存
+                this.emoticonCache = emoticonMap;
+                this.emoticonCacheTime = now;
+
+                this.log('info', `成功获取 ${totalEmoticons} 个表情符号，已缓存`);
+                return emoticonMap;
+
+            } catch (error) {
+                this.log('error', `获取表情符号数据失败: ${error.message}`);
+
+                // 如果有旧缓存，继续使用
+                if (this.emoticonCache) {
+                    this.log('info', '使用过期的缓存数据');
+                    return this.emoticonCache;
+                }
+
+                // 返回空映射表
+                return {};
+            }
+        },
+
+        // 处理B站表情符号 - 基于真实B站API数据
+        processEmoticons(content) {
+            if (!content) return content;
+
+            const emoticonMap = this.getEmoticonMap();
+            let processedContent = content;
+            let replacedCount = 0;
+
+            // 匹配B站表情符号格式：[表情名] 或 [tv_表情名]
+            const emoticonPattern = /\[([^\]]+)\]/g;
+
+            processedContent = processedContent.replace(emoticonPattern, (match, emoticonName) => {
+                const fullEmoticon = `[${emoticonName}]`;
+                const imageUrl = emoticonMap[fullEmoticon];
+
+                if (imageUrl) {
+                    replacedCount++;
+                    // 使用与B站原生完全一致的HTML结构和样式
+                    return `<img class="emoji" src="${imageUrl}" alt="${fullEmoticon}" title="${fullEmoticon}" style="width: 20px; height: 20px; vertical-align: text-bottom; margin: 0 1px; display: inline-block; object-fit: contain;" loading="lazy">`;
+                }
+
+                // 如果没有找到对应的表情，保持原文本
+                return match;
+            });
+
+            if (replacedCount > 0) {
+                this.log('info', `处理了 ${replacedCount} 个表情符号`);
+            }
+
+            return processedContent;
+        },
+
         // 获取视频标题
         async getVideoTitle(videoId, isAv = false) {
             try {
@@ -126,22 +226,23 @@
             }
         },
 
-        // 处理评论内容中的视频链接 - 增强版
+        // 处理评论内容中的视频链接和表情符号 - 增强版
         async processCommentContentEnhanced(content) {
             if (!content) return '内容为空';
 
             const escapedContent = this.escapeHtml(content);
 
+            // 先处理表情符号
+            let processedContent = this.processEmoticons(escapedContent);
+
             // 识别av号和BV号的正则表达式
             const avPattern = /\b(av)(\d+)\b/gi;
-
-            let processedContent = escapedContent;
             const videoPromises = [];
 
             // 收集所有视频链接
             const videoMatches = [];
 
-            // 处理av号
+            // 处理av号 - 在原始内容中查找，避免表情符号干扰
             let match;
             while ((match = avPattern.exec(escapedContent)) !== null) {
                 videoMatches.push({
@@ -152,7 +253,7 @@
                 });
             }
 
-            // 处理BV号
+            // 处理BV号 - 在原始内容中查找，避免表情符号干扰
             const bvRegex = /\b(BV[a-zA-Z0-9]+)\b/gi;
             while ((match = bvRegex.exec(escapedContent)) !== null) {
                 videoMatches.push({
