@@ -20,7 +20,10 @@
         COMMENT_TYPE: 1, // 视频评论类型
         MAX_RETRIES: 3,
         RETRY_DELAY: 1000,
-        REQUEST_TIMEOUT: 10000
+        REQUEST_TIMEOUT: 10000,
+        REPLY_PAGE_SIZE: 20, // 单页回复数，接口通常会限制最大值
+        REPLY_MAX_PAGES: 100, // 回复最大抓取页数，100*20=2000
+        REPLY_FETCH_CONCURRENCY: 10 // 回复抓取并发数
     };
 
     // 工具函数
@@ -129,9 +132,9 @@
                 let totalEmoticons = 0;
 
                 if (data.data && data.data.packages) {
-                    for (const package of data.data.packages) {
-                        if (package.emote && Array.isArray(package.emote)) {
-                            for (const emote of package.emote) {
+                    for (const emoticonPackage of data.data.packages) {
+                        if (emoticonPackage.emote && Array.isArray(emoticonPackage.emote)) {
+                            for (const emote of emoticonPackage.emote) {
                                 if (emote.text && emote.url) {
                                     emoticonMap[emote.text] = emote.url;
                                     totalEmoticons++;
@@ -232,58 +235,97 @@
 
             const escapedContent = this.escapeHtml(content);
 
-            // 先处理表情符号
-            let processedContent = this.processEmoticons(escapedContent);
-
-            // 识别av号和BV号的正则表达式
-            const avPattern = /\b(av)(\d+)\b/gi;
-            const videoPromises = [];
-
-            // 收集所有视频链接
+            // 收集视频匹配并记录占用区间，避免同一片段被重复识别
             const videoMatches = [];
+            const occupiedRanges = [];
 
-            // 处理av号 - 在原始内容中查找，避免表情符号干扰
+            const hasOverlap = (start, end) => {
+                return occupiedRanges.some(range => start < range.end && end > range.start);
+            };
+
+            const normalizeBvid = (bvid) => bvid.replace(/^bv/i, 'BV');
+
+            const addVideoMatch = (fullMatch, type, id, index) => {
+                if (!id) return;
+
+                const start = index;
+                const end = start + fullMatch.length;
+                if (hasOverlap(start, end)) return;
+
+                videoMatches.push({
+                    type,
+                    id,
+                    fullMatch,
+                    start,
+                    end
+                });
+
+                occupiedRanges.push({ start, end });
+            };
+
+            // 优先匹配完整视频链接，保证短链如 https://b23.tv/BV... 作为整体处理
+            const videoUrlPattern = /https?:\/\/(?:www\.)?(?:b23\.tv\/(?:av\d+|BV[a-zA-Z0-9]+)|bilibili\.com\/video\/(?:av\d+|BV[a-zA-Z0-9]+)(?:\/?[^\s<>"']*)?)/gi;
             let match;
+            while ((match = videoUrlPattern.exec(escapedContent)) !== null) {
+                const fullUrl = match[0];
+                const avMatch = fullUrl.match(/(?:\/video\/|b23\.tv\/)av(\d+)/i);
+                const bvMatch = fullUrl.match(/(?:\/video\/|b23\.tv\/)(BV[a-zA-Z0-9]+)/i);
+
+                if (avMatch) {
+                    addVideoMatch(fullUrl, 'av', avMatch[1], match.index);
+                } else if (bvMatch) {
+                    addVideoMatch(fullUrl, 'bv', normalizeBvid(bvMatch[1]), match.index);
+                }
+            }
+
+            // 再匹配纯 av/BV 号
+            const avPattern = /\bav(\d+)\b/gi;
             while ((match = avPattern.exec(escapedContent)) !== null) {
-                videoMatches.push({
-                    match: match[0],
-                    type: 'av',
-                    id: match[2],
-                    fullMatch: match[0]
-                });
+                addVideoMatch(match[0], 'av', match[1], match.index);
             }
 
-            // 处理BV号 - 在原始内容中查找，避免表情符号干扰
-            const bvRegex = /\b(BV[a-zA-Z0-9]+)\b/gi;
-            while ((match = bvRegex.exec(escapedContent)) !== null) {
-                videoMatches.push({
-                    match: match[0],
-                    type: 'bv',
-                    id: match[0],
-                    fullMatch: match[0]
-                });
+            const bvPattern = /\b(BV[a-zA-Z0-9]+)\b/gi;
+            while ((match = bvPattern.exec(escapedContent)) !== null) {
+                addVideoMatch(match[0], 'bv', normalizeBvid(match[1]), match.index);
             }
 
-            // 为每个视频获取标题
-            for (const video of videoMatches) {
-                const titlePromise = this.getVideoTitle(video.id, video.type === 'av')
-                    .then(title => ({ ...video, title }));
-                videoPromises.push(titlePromise);
+            // 没有视频匹配时仅处理表情
+            if (videoMatches.length === 0) {
+                return this.processEmoticons(escapedContent);
             }
 
-            // 等待所有标题获取完成
-            const videoData = await Promise.all(videoPromises);
+            // 使用占位符避免后续 replace 命中已插入的链接 HTML
+            const sortedMatches = videoMatches.sort((a, b) => a.start - b.start);
+            let contentWithPlaceholders = '';
+            let cursor = 0;
 
-            // 替换视频链接
+            sortedMatches.forEach((video, index) => {
+                video.placeholder = `__BILI_VIDEO_LINK_${index}__`;
+                contentWithPlaceholders += escapedContent.slice(cursor, video.start) + video.placeholder;
+                cursor = video.end;
+            });
+            contentWithPlaceholders += escapedContent.slice(cursor);
+
+            // 先处理表情符号，再回填视频链接
+            let processedContent = this.processEmoticons(contentWithPlaceholders);
+
+            const titlePromiseCache = new Map();
+            const videoData = await Promise.all(sortedMatches.map(video => {
+                const cacheKey = `${video.type}:${video.id}`;
+                if (!titlePromiseCache.has(cacheKey)) {
+                    titlePromiseCache.set(cacheKey, this.getVideoTitle(video.id, video.type === 'av'));
+                }
+                return titlePromiseCache.get(cacheKey).then(title => ({ ...video, title }));
+            }));
+
             for (const video of videoData) {
                 const url = video.type === 'av'
                     ? `https://www.bilibili.com/video/av${video.id}/`
                     : `https://www.bilibili.com/video/${video.id}/`;
 
                 const title = video.title || video.fullMatch;
-                const linkHtml = this.createVideoLinkHtml(url, title, video.fullMatch);
-
-                processedContent = processedContent.replace(video.fullMatch, linkHtml);
+                const linkHtml = this.createVideoLinkHtml(url, title);
+                processedContent = processedContent.replace(video.placeholder, linkHtml);
             }
 
             return processedContent;
@@ -407,21 +449,21 @@
             this.cacheExpiry = 5 * 60 * 1000; // 5分钟缓存
         }
 
-        getCacheKey(type, oid, rpid = null, page = 1) {
-            return `${type}_${oid}_${rpid || 'root'}_${page}`;
+        getCacheKey(type, oid, rpid = null, page = 1, pageSize = '') {
+            return `${type}_${oid}_${rpid || 'root'}_${page}_${pageSize}`;
         }
 
         isValidCache(cacheItem) {
             return cacheItem && (Date.now() - cacheItem.timestamp) < this.cacheExpiry;
         }
 
-        async getCommentReplies(oid, rootRpid, page = 1, pageSize = 20) {
-            const cacheKey = this.getCacheKey('replies', oid, rootRpid, page);
+        async getCommentReplies(oid, rootRpid, page = 1, pageSize = CONFIG.REPLY_PAGE_SIZE) {
+            const cacheKey = this.getCacheKey('replies', oid, rootRpid, page, pageSize);
             const cached = this.cache.get(cacheKey);
 
             if (this.isValidCache(cached)) {
                 Utils.log('info', `使用缓存数据: ${cacheKey}`);
-                return cached.data;
+                return { ...cached.data, __fromCache: true };
             }
 
             try {
@@ -447,7 +489,7 @@
                 });
 
                 Utils.log('info', `成功获取评论回复: ${data.data?.replies?.length || 0} 条`);
-                return data.data;
+                return { ...data.data, __fromCache: false };
 
             } catch (error) {
                 Utils.log('error', '获取评论回复失败:', error);
@@ -455,37 +497,99 @@
             }
         }
 
-        async getAllReplies(oid, rootRpid, maxPages = 10) {
-            const allReplies = [];
-            let page = 1;
-            let hasMore = true;
+        async getAllReplies(oid, rootRpid, maxPages = CONFIG.REPLY_MAX_PAGES, pageSize = CONFIG.REPLY_PAGE_SIZE, concurrency = CONFIG.REPLY_FETCH_CONCURRENCY) {
+            const allRepliesCacheKey = this.getCacheKey('replies_all', oid, rootRpid, maxPages, pageSize);
+            const allRepliesCached = this.cache.get(allRepliesCacheKey);
+            if (this.isValidCache(allRepliesCached)) {
+                Utils.log('info', `使用完整回复缓存: ${allRepliesCacheKey}`);
+                return allRepliesCached.data;
+            }
 
-            while (hasMore && page <= maxPages) {
-                try {
-                    const data = await this.getCommentReplies(oid, rootRpid, page);
+            const pageResults = new Map();
+            const safeConcurrency = Math.max(1, Number(concurrency) || 1);
 
-                    if (data?.replies && data.replies.length > 0) {
-                        allReplies.push(...data.replies);
+            let firstPageData;
+            try {
+                firstPageData = await this.getCommentReplies(oid, rootRpid, 1, pageSize);
+            } catch (error) {
+                Utils.log('error', '获取第1页回复失败:', error);
+                return [];
+            }
 
-                        // 检查是否还有更多页
-                        const pageInfo = data.page;
-                        hasMore = pageInfo && page < Math.ceil(pageInfo.count / pageInfo.size);
-                        page++;
+            pageResults.set(1, firstPageData?.replies || []);
 
-                        // 避免请求过快
-                        if (hasMore) {
-                            await Utils.sleep(500);
+            const firstPageInfo = firstPageData?.page;
+            const hasValidPageInfo = !!(firstPageInfo && firstPageInfo.count && firstPageInfo.size);
+            let totalPages = hasValidPageInfo
+                ? Math.ceil(firstPageInfo.count / firstPageInfo.size)
+                : 1;
+            totalPages = Math.max(1, Math.min(totalPages, maxPages));
+
+            if (hasValidPageInfo && totalPages > 1) {
+                const remainingPages = [];
+                for (let p = 2; p <= totalPages; p++) {
+                    remainingPages.push(p);
+                }
+
+                let cursor = 0;
+                const workerCount = Math.min(safeConcurrency, remainingPages.length);
+
+                const worker = async () => {
+                    while (true) {
+                        const currentIndex = cursor++;
+                        if (currentIndex >= remainingPages.length) {
+                            break;
                         }
-                    } else {
-                        hasMore = false;
+
+                        const currentPage = remainingPages[currentIndex];
+                        try {
+                            const data = await this.getCommentReplies(oid, rootRpid, currentPage, pageSize);
+                            pageResults.set(currentPage, data?.replies || []);
+                        } catch (error) {
+                            Utils.log('error', `获取第${currentPage}页回复失败:`, error);
+                            pageResults.set(currentPage, []);
+                        }
                     }
-                } catch (error) {
-                    Utils.log('error', `获取第${page}页回复失败:`, error);
-                    hasMore = false;
+                };
+
+                await Promise.all(Array.from({ length: workerCount }, () => worker()));
+            } else if (!hasValidPageInfo) {
+                // 无分页信息时降级顺序拉取，直到某页无数据或达到页数上限
+                Utils.log('warn', '回复分页信息缺失，降级为顺序抓取');
+                for (let page = 2; page <= maxPages; page++) {
+                    try {
+                        const data = await this.getCommentReplies(oid, rootRpid, page, pageSize);
+                        const replies = data?.replies || [];
+                        if (replies.length === 0) {
+                            break;
+                        }
+                        pageResults.set(page, replies);
+                    } catch (error) {
+                        Utils.log('error', `获取第${page}页回复失败:`, error);
+                        break;
+                    }
                 }
             }
 
-            Utils.log('info', `总共获取到 ${allReplies.length} 条回复`);
+            const allReplies = [];
+            const fetchedPages = Array.from(pageResults.keys()).sort((a, b) => a - b);
+            for (const page of fetchedPages) {
+                const pageReplies = pageResults.get(page);
+                if (pageReplies && pageReplies.length > 0) {
+                    allReplies.push(...pageReplies);
+                }
+            }
+
+            if (hasValidPageInfo && Math.ceil(firstPageInfo.count / firstPageInfo.size) > maxPages) {
+                Utils.log('warn', `回复抓取触发页数上限: maxPages=${maxPages}, pageSize=${pageSize}, 已获取=${allReplies.length}`);
+            }
+
+            this.cache.set(allRepliesCacheKey, {
+                data: allReplies,
+                timestamp: Date.now()
+            });
+
+            Utils.log('info', `总共获取到 ${allReplies.length} 条回复 (并发=${safeConcurrency})`);
             return allReplies;
         }
 
@@ -1469,6 +1573,8 @@
         }
 
         renderRepliesContent(container, replies, totalCount) {
+            const replyFloorMap = this.buildReplyFloorMap(replies);
+
             // 创建排序控制 - 暗色主题
             const sortControls = document.createElement('div');
             sortControls.style.cssText = `
@@ -1510,13 +1616,13 @@
             let timeOrder = 'desc'; // 'desc' 为倒序（最新在前），'asc' 为正序（最旧在前）
 
             // 渲染回复列表
-            this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder);
+            this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder, replyFloorMap);
 
             // 绑定排序事件
             hotSortBtn.onclick = () => {
                 currentSort = 'hot';
                 this.updateSortButtons(hotSortBtn, timeSortBtn);
-                this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder);
+                this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder, replyFloorMap);
             };
 
             timeSortBtn.onclick = () => {
@@ -1533,7 +1639,7 @@
                 timeSortBtn.textContent = `按时间${timeOrder === 'desc' ? '↓' : '↑'}`;
 
                 this.updateSortButtons(timeSortBtn, hotSortBtn);
-                this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder);
+                this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder, replyFloorMap);
             };
 
             container.appendChild(sortControls);
@@ -1592,7 +1698,47 @@
             inactiveBtn.classList.remove('active');
         }
 
-        renderRepliesList(container, replies, sortType, timeOrder = 'desc') {
+        buildReplyFloorMap(replies) {
+            const floorMap = new Map();
+            const usedFloors = new Set();
+
+            // 优先使用接口直接返回的楼层字段
+            replies.forEach(reply => {
+                const apiFloor = Number(reply?.floor ?? reply?.reply_control?.floor);
+                if (Number.isFinite(apiFloor) && apiFloor > 0) {
+                    const normalizedFloor = Math.floor(apiFloor);
+                    floorMap.set(reply, { value: normalizedFloor, source: 'api' });
+                    usedFloors.add(normalizedFloor);
+                }
+            });
+
+            // 对缺失楼层的回复，按时间顺序补齐稳定楼层号
+            const missingReplies = replies.filter(reply => !floorMap.has(reply));
+            if (missingReplies.length > 0) {
+                const sortedByTime = [...missingReplies].sort((a, b) => {
+                    const timeA = Number(a?.ctime || 0);
+                    const timeB = Number(b?.ctime || 0);
+                    if (timeA !== timeB) {
+                        return timeA - timeB;
+                    }
+                    return Number(a?.rpid || 0) - Number(b?.rpid || 0);
+                });
+
+                let floor = 1;
+                sortedByTime.forEach(reply => {
+                    while (usedFloors.has(floor)) {
+                        floor++;
+                    }
+                    floorMap.set(reply, { value: floor, source: 'computed' });
+                    usedFloors.add(floor);
+                    floor++;
+                });
+            }
+
+            return floorMap;
+        }
+
+        renderRepliesList(container, replies, sortType, timeOrder = 'desc', replyFloorMap = new Map()) {
             // 排序回复
             const sortedReplies = [...replies].sort((a, b) => {
                 if (sortType === 'hot') {
@@ -1610,12 +1756,13 @@
 
             // 渲染每条回复
             sortedReplies.forEach((reply) => {
-                const replyElement = this.createReplyElement(reply);
+                const floorInfo = replyFloorMap.get(reply) || null;
+                const replyElement = this.createReplyElement(reply, floorInfo);
                 container.appendChild(replyElement);
             });
         }
 
-        createReplyElement(reply) {
+        createReplyElement(reply, floorInfo = null) {
             const replyDiv = document.createElement('div');
             replyDiv.style.cssText = `
                 padding: 16px 20px;
@@ -1711,6 +1858,24 @@
 
             userInfo.appendChild(username);
             userInfo.appendChild(timeSpan);
+
+            if (floorInfo && floorInfo.value) {
+                const floorTag = document.createElement('span');
+                floorTag.style.cssText = `
+                    margin-left: auto;
+                    padding: 2px 8px;
+                    border-radius: 999px;
+                    background: rgba(0, 161, 214, 0.12);
+                    border: 1px solid rgba(0, 161, 214, 0.35);
+                    color: #40a9ff;
+                    font-size: 12px;
+                    line-height: 1.4;
+                    white-space: nowrap;
+                `;
+                floorTag.textContent = `${floorInfo.value}楼`;
+                floorTag.title = floorInfo.source === 'api' ? '接口返回楼层' : '根据回复时间顺序计算的楼层';
+                userInfo.appendChild(floorTag);
+            }
 
             // 评论内容 - 暗色主题，支持视频链接识别
             const messageDiv = document.createElement('div');
