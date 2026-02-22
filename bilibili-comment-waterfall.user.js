@@ -97,88 +97,90 @@
             return div.innerHTML;
         },
 
-        // B站表情符号缓存 - 会话级缓存
-        emoticonCache: null,
-        emoticonCacheTime: null,
-        emoticonCacheExpiry: 30 * 60 * 1000, // 30分钟缓存过期时间
+        // 表情处理：仅使用当前回复自带 emote 映射
 
-        // 动态获取B站表情符号映射表
-        async fetchEmoticonMap() {
-            const now = Date.now();
-
-            // 检查缓存是否有效
-            if (this.emoticonCache && this.emoticonCacheTime &&
-                (now - this.emoticonCacheTime) < this.emoticonCacheExpiry) {
-                this.log('info', '使用缓存的表情符号数据');
-                return this.emoticonCache;
-            }
-
-            try {
-                this.log('info', '正在获取B站表情符号数据...');
-                const response = await fetch('https://api.bilibili.com/x/emote/user/panel/web?business=reply');
-
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-                }
-
-                const data = await response.json();
-
-                if (data.code !== 0) {
-                    throw new Error(`API错误: ${data.message || '未知错误'}`);
-                }
-
-                // 解析表情数据
-                const emoticonMap = {};
-                let totalEmoticons = 0;
-
-                if (data.data && data.data.packages) {
-                    for (const emoticonPackage of data.data.packages) {
-                        if (emoticonPackage.emote && Array.isArray(emoticonPackage.emote)) {
-                            for (const emote of emoticonPackage.emote) {
-                                if (emote.text && emote.url) {
-                                    emoticonMap[emote.text] = emote.url;
-                                    totalEmoticons++;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 更新缓存
-                this.emoticonCache = emoticonMap;
-                this.emoticonCacheTime = now;
-
-                this.log('info', `成功获取 ${totalEmoticons} 个表情符号，已缓存`);
-                return emoticonMap;
-
-            } catch (error) {
-                this.log('error', `获取表情符号数据失败: ${error.message}`);
-
-                // 如果有旧缓存，继续使用
-                if (this.emoticonCache) {
-                    this.log('info', '使用过期的缓存数据');
-                    return this.emoticonCache;
-                }
-
-                // 返回空映射表
-                return {};
-            }
+        normalizeEmoticonUrl(url) {
+            if (!url || typeof url !== 'string') return null;
+            const normalizedUrl = url.trim();
+            if (!normalizedUrl) return null;
+            if (normalizedUrl.startsWith('//')) return `https:${normalizedUrl}`;
+            if (/^https?:\/\//i.test(normalizedUrl)) return normalizedUrl;
+            if (normalizedUrl.startsWith('/')) return `https://www.bilibili.com${normalizedUrl}`;
+            return null;
         },
 
-        // 处理B站表情符号 - 基于真实B站API数据
-        processEmoticons(content) {
+        extractEmoticonUrl(emote) {
+            if (!emote) return null;
+            if (typeof emote === 'string') {
+                return this.normalizeEmoticonUrl(emote);
+            }
+
+            const candidates = [
+                emote.url,
+                emote.jump_url,
+                emote.webp,
+                emote.gif,
+                emote.image,
+                emote.icon,
+                emote.dynamic_url,
+                emote.static_url,
+                emote?.meta?.url,
+                emote?.meta?.jump_url
+            ];
+
+            for (const candidate of candidates) {
+                const normalized = this.normalizeEmoticonUrl(candidate);
+                if (normalized) {
+                    return normalized;
+                }
+            }
+
+            return null;
+        },
+
+        // 从当前回复中提取原生表情映射
+        buildReplyEmoticonMap(replyEmoteData) {
+            const map = {};
+            if (!replyEmoteData || typeof replyEmoteData !== 'object') {
+                return map;
+            }
+
+            for (const [rawKey, emote] of Object.entries(replyEmoteData)) {
+                const imageUrl = this.extractEmoticonUrl(emote);
+                if (!imageUrl) continue;
+
+                const keys = new Set();
+                if (typeof rawKey === 'string' && rawKey.trim()) {
+                    keys.add(rawKey.trim());
+                }
+                if (typeof emote?.text === 'string' && emote.text.trim()) {
+                    keys.add(emote.text.trim());
+                }
+
+                keys.forEach(key => {
+                    const cleanKey = key.replace(/^\[/, '').replace(/\]$/, '');
+                    const fullEmoticon = `[${cleanKey}]`;
+                    map[fullEmoticon] = imageUrl;
+                });
+            }
+
+            return map;
+        },
+
+        // 处理B站表情符号 - 仅使用回复自带映射
+        processEmoticons(content, replyEmoteData = null) {
             if (!content) return content;
 
-            const emoticonMap = this.getEmoticonMap();
+            const emoticonPattern = /\[([^\]]+)\]/g;
+            const replyEmoticonMap = this.buildReplyEmoticonMap(replyEmoteData);
+            if (Object.keys(replyEmoticonMap).length === 0) return content;
+
             let processedContent = content;
             let replacedCount = 0;
 
-            // 匹配B站表情符号格式：[表情名] 或 [tv_表情名]
-            const emoticonPattern = /\[([^\]]+)\]/g;
-
             processedContent = processedContent.replace(emoticonPattern, (match, emoticonName) => {
                 const fullEmoticon = `[${emoticonName}]`;
-                const imageUrl = emoticonMap[fullEmoticon];
+                const imageUrl = replyEmoticonMap[fullEmoticon];
 
                 if (imageUrl) {
                     replacedCount++;
@@ -230,7 +232,7 @@
         },
 
         // 处理评论内容中的视频链接和表情符号 - 增强版
-        async processCommentContentEnhanced(content) {
+        async processCommentContentEnhanced(content, replyEmoteData = null) {
             if (!content) return '内容为空';
 
             const escapedContent = this.escapeHtml(content);
@@ -291,7 +293,7 @@
 
             // 没有视频匹配时仅处理表情
             if (videoMatches.length === 0) {
-                return this.processEmoticons(escapedContent);
+                return this.processEmoticons(escapedContent, replyEmoteData);
             }
 
             // 使用占位符避免后续 replace 命中已插入的链接 HTML
@@ -307,7 +309,7 @@
             contentWithPlaceholders += escapedContent.slice(cursor);
 
             // 先处理表情符号，再回填视频链接
-            let processedContent = this.processEmoticons(contentWithPlaceholders);
+            let processedContent = this.processEmoticons(contentWithPlaceholders, replyEmoteData);
 
             const titlePromiseCache = new Map();
             const videoData = await Promise.all(sortedMatches.map(video => {
@@ -375,24 +377,6 @@
 
                 link.addEventListener('mouseup', () => {
                     link.style.transform = 'translateY(-1px) scale(1)';
-                });
-            });
-        },
-
-        // 为简化版视频链接添加悬停效果
-        addVideoLinkHoverEffects(container) {
-            const videoLinks = container.querySelectorAll('.bili-video-link-simple');
-            videoLinks.forEach(link => {
-                link.addEventListener('mouseover', () => {
-                    link.style.borderBottomColor = '#00a1d6';
-                    link.style.color = '#40a9ff';
-                    link.style.background = 'rgba(0,161,214,0.1)';
-                });
-
-                link.addEventListener('mouseout', () => {
-                    link.style.borderBottomColor = 'transparent';
-                    link.style.color = '#00a1d6';
-                    link.style.background = 'rgba(0,161,214,0.05)';
                 });
             });
         },
@@ -508,24 +492,19 @@
             const pageResults = new Map();
             const safeConcurrency = Math.max(1, Number(concurrency) || 1);
 
-            let firstPageData;
-            try {
-                firstPageData = await this.getCommentReplies(oid, rootRpid, 1, pageSize);
-            } catch (error) {
-                Utils.log('error', '获取第1页回复失败:', error);
-                return [];
-            }
+            const firstPageData = await this.getCommentReplies(oid, rootRpid, 1, pageSize);
 
             pageResults.set(1, firstPageData?.replies || []);
 
             const firstPageInfo = firstPageData?.page;
-            const hasValidPageInfo = !!(firstPageInfo && firstPageInfo.count && firstPageInfo.size);
-            let totalPages = hasValidPageInfo
-                ? Math.ceil(firstPageInfo.count / firstPageInfo.size)
-                : 1;
+            if (!(firstPageInfo && firstPageInfo.count && firstPageInfo.size)) {
+                throw new Error('回复分页信息缺失');
+            }
+
+            let totalPages = Math.ceil(firstPageInfo.count / firstPageInfo.size);
             totalPages = Math.max(1, Math.min(totalPages, maxPages));
 
-            if (hasValidPageInfo && totalPages > 1) {
+            if (totalPages > 1) {
                 const remainingPages = [];
                 for (let p = 2; p <= totalPages; p++) {
                     remainingPages.push(p);
@@ -542,33 +521,12 @@
                         }
 
                         const currentPage = remainingPages[currentIndex];
-                        try {
-                            const data = await this.getCommentReplies(oid, rootRpid, currentPage, pageSize);
-                            pageResults.set(currentPage, data?.replies || []);
-                        } catch (error) {
-                            Utils.log('error', `获取第${currentPage}页回复失败:`, error);
-                            pageResults.set(currentPage, []);
-                        }
+                        const data = await this.getCommentReplies(oid, rootRpid, currentPage, pageSize);
+                        pageResults.set(currentPage, data?.replies || []);
                     }
                 };
 
                 await Promise.all(Array.from({ length: workerCount }, () => worker()));
-            } else if (!hasValidPageInfo) {
-                // 无分页信息时降级顺序拉取，直到某页无数据或达到页数上限
-                Utils.log('warn', '回复分页信息缺失，降级为顺序抓取');
-                for (let page = 2; page <= maxPages; page++) {
-                    try {
-                        const data = await this.getCommentReplies(oid, rootRpid, page, pageSize);
-                        const replies = data?.replies || [];
-                        if (replies.length === 0) {
-                            break;
-                        }
-                        pageResults.set(page, replies);
-                    } catch (error) {
-                        Utils.log('error', `获取第${page}页回复失败:`, error);
-                        break;
-                    }
-                }
             }
 
             const allReplies = [];
@@ -580,7 +538,7 @@
                 }
             }
 
-            if (hasValidPageInfo && Math.ceil(firstPageInfo.count / firstPageInfo.size) > maxPages) {
+            if (Math.ceil(firstPageInfo.count / firstPageInfo.size) > maxPages) {
                 Utils.log('warn', `回复抓取触发页数上限: maxPages=${maxPages}, pageSize=${pageSize}, 已获取=${allReplies.length}`);
             }
 
@@ -827,20 +785,8 @@
             this.viewMoreButtons.add(button);
             button.setAttribute('data-waterfall-processed', 'true');
 
-            // 先尝试提取评论信息
             const commentInfo = this.extractCommentInfo(container, threadRenderer);
-
             if (!commentInfo) {
-                // 如果无法提取评论信息，创建一个基本的信息对象
-                const basicInfo = {
-                    rootId: 'unknown',
-                    oid: this.extractVideoId() || 'unknown',
-                    replyCount: 0,
-                    container,
-                    commentElement: threadRenderer
-                };
-                this.addExpandButtonToStableLocation(commentInfo.commentElement, basicInfo);
-                Utils.log('info', '已添加评论展开按钮（无法提取完整信息）');
                 return;
             }
 
@@ -848,60 +794,33 @@
             Utils.log('info', `已添加评论展开按钮，评论ID: ${commentInfo.rootId}, 回复数: ${commentInfo.replyCount}`);
         }
 
-        // 将评论展开按钮添加到稳定的位置（优化版）
+        // 将评论展开按钮添加到固定位置
         addExpandButtonToStableLocation(threadRenderer, commentInfo) {
-            try {
-                // 检查是否已经存在评论展开按钮
-                if (this.findExpandButton(threadRenderer)) {
-                    Utils.log('info', '评论展开按钮已存在，跳过添加');
-                    return;
-                }
-
-                // 直接使用已验证有效的容器选择器
-                let targetContainer = threadRenderer.shadowRoot?.querySelector("#replies");
-
-                if (targetContainer) {
-                    Utils.log('info', '使用主要容器: #replies');
-                } else {
-                    // 降级方案：使用threadRenderer本身
-                    targetContainer = threadRenderer;
-                    Utils.log('warn', '未找到#replies容器，使用threadRenderer作为降级方案');
-                }
-
-                // 创建评论展开按钮
-                const expandBtn = this.createExpandButton(commentInfo);
-
-                // 创建一个包装容器，使按钮更稳定并居中
-                const buttonWrapper = document.createElement('div');
-                buttonWrapper.className = 'bili-comment-expand-wrapper';
-                buttonWrapper.style.cssText = `
-                    display: flex;
-                    justify-content: center;
-                    align-items: center;
-                    margin: 8px 0;
-                    position: relative;
-                    z-index: 1000;
-                    width: 100%;
-                `;
-                buttonWrapper.appendChild(expandBtn);
-
-                // 将按钮添加到稳定位置
-                if (targetContainer.shadowRoot) {
-                    // 如果目标容器有shadowRoot，添加到shadowRoot中
-                    targetContainer.shadowRoot.appendChild(buttonWrapper);
-                    Utils.log('info', `评论展开按钮已添加到稳定位置(shadowRoot): ${targetContainer.tagName || 'unknown'}`);
-                } else {
-                    // 否则直接添加到容器中
-                    targetContainer.appendChild(buttonWrapper);
-                    Utils.log('info', `评论展开按钮已添加到稳定位置: ${targetContainer.tagName || 'unknown'}`);
-                }
-
-            } catch (error) {
-                Utils.log('error', '添加评论展开按钮到稳定位置失败:', error);
-                Utils.log('info', '尝试使用降级方案...');
-                // 降级到原始方法
-                this.addExpandButton(commentInfo.container || threadRenderer, commentInfo);
+            if (this.findExpandButton(threadRenderer)) {
+                Utils.log('info', '评论展开按钮已存在，跳过添加');
+                return;
             }
+
+            const targetContainer = threadRenderer.shadowRoot?.querySelector("#replies");
+            if (!targetContainer) {
+                throw new Error('未找到目标容器 #replies');
+            }
+
+            const expandBtn = this.createExpandButton(commentInfo);
+            const buttonWrapper = document.createElement('div');
+            buttonWrapper.className = 'bili-comment-expand-wrapper';
+            buttonWrapper.style.cssText = `
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                margin: 8px 0;
+                position: relative;
+                z-index: 1000;
+                width: 100%;
+            `;
+            buttonWrapper.appendChild(expandBtn);
+            targetContainer.appendChild(buttonWrapper);
+            Utils.log('info', '评论展开按钮已添加到 #replies');
         }
 
         // 创建评论展开按钮（提取为独立方法）
@@ -970,17 +889,6 @@
             return expandBtn;
         }
 
-        // 原始的添加评论展开按钮方法（作为降级选项）
-        addExpandButton(container, commentInfo) {
-            // 检查是否已经添加过评论展开按钮
-            if (container.querySelector('.bili-comment-expand-btn')) {
-                return;
-            }
-
-            const expandBtn = this.createExpandButton(commentInfo);
-            container.appendChild(expandBtn);
-        }
-
         handleExpandClick(commentInfo) {
             // 调用主控制器的处理函数
             if (this.onViewMoreClick) {
@@ -1025,196 +933,15 @@
         }
 
         extractCommentId(threadRenderer) {
-            // 方法1: 从__data对象获取（最新的B站结构）
-            if (threadRenderer.__data && threadRenderer.__data.rpid) {
-                const rpid = threadRenderer.__data.rpid.toString();
-                Utils.log('info', `方法1获取到rpid: ${rpid}`);
-                return rpid;
-            }
-
-            // 方法2: 从data属性获取
-            if (threadRenderer.data && threadRenderer.data.rpid) {
-                const rpid = threadRenderer.data.rpid.toString();
-                Utils.log('info', `方法2获取到rpid: ${rpid}`);
-                return rpid;
-            }
-
-            // 方法3: 从Shadow DOM中的commentRenderer获取
-            if (threadRenderer.shadowRoot) {
-                const commentRenderer = threadRenderer.shadowRoot.querySelector('bili-comment-renderer');
-                if (commentRenderer) {
-                    // 从commentRenderer的__data获取
-                    if (commentRenderer.__data && commentRenderer.__data.rpid) {
-                        const rpid = commentRenderer.__data.rpid.toString();
-                        Utils.log('info', `方法3获取到rpid: ${rpid}`);
-                        return rpid;
-                    }
-
-                    // 从commentRenderer的data属性获取
-                    if (commentRenderer.data && commentRenderer.data.rpid) {
-                        const rpid = commentRenderer.data.rpid.toString();
-                        Utils.log('info', `方法3.1获取到rpid: ${rpid}`);
-                        return rpid;
-                    }
-
-                    // 从属性获取
-                    const rpidAttr = commentRenderer.getAttribute('data-rpid') ||
-                                   commentRenderer.getAttribute('rpid');
-                    if (rpidAttr) {
-                        Utils.log('info', `方法3.2获取到rpid: ${rpidAttr}`);
-                        return rpidAttr;
-                    }
-                }
-            }
-
-            // 方法4: 传统方法 - 从属性获取
-            let rpid = threadRenderer.getAttribute('data-rpid') ||
-                      threadRenderer.getAttribute('rpid') ||
-                      threadRenderer.getAttribute('data-id');
-
-            if (rpid) {
-                Utils.log('info', `方法4获取到rpid: ${rpid}`);
-                return rpid;
-            }
-
-            // 方法5: 从dataset获取
-            const dataRpid = threadRenderer.dataset?.rpid;
-            if (dataRpid) {
-                Utils.log('info', `方法5获取到rpid: ${dataRpid}`);
-                return dataRpid;
-            }
-
-            Utils.log('warn', '所有方法都无法获取到rpid');
-            return null;
-        }
-
-
-
-        extractIdFromComponent(component) {
-            // 尝试从组件本身的属性获取
-            const possibleAttributes = ['data-rpid', 'rpid', 'data-id', 'comment-id'];
-
-            for (const attr of possibleAttributes) {
-                const value = component.getAttribute(attr);
-                if (value) {
-                    return value;
-                }
-            }
-
-            // 尝试从Shadow DOM内部查找
-            if (component.shadowRoot) {
-                const shadowElements = component.shadowRoot.querySelectorAll('[data-rpid], [rpid], [data-id]');
-                for (const element of shadowElements) {
-                    for (const attr of possibleAttributes) {
-                        const value = element.getAttribute(attr);
-                        if (value) {
-                            return value;
-                        }
-                    }
-                }
-            }
-
-            // 尝试从子元素查找
-            const childElements = component.querySelectorAll('[data-rpid], [rpid], [data-id]');
-            for (const element of childElements) {
-                for (const attr of possibleAttributes) {
-                    const value = element.getAttribute(attr);
-                    if (value) {
-                        return value;
-                    }
-                }
-            }
-
-            // 如果还是找不到，尝试从URL或其他地方提取
-            try {
-                // 检查组件内是否有包含ID的链接
-                const links = component.querySelectorAll('a[href]');
-                for (const link of links) {
-                    const href = link.getAttribute('href') || '';
-                    const idMatch = href.match(/\/(\d+)/);
-                    if (idMatch) {
-                        return idMatch[1];
-                    }
-                }
-            } catch (error) {
-                // 静默处理错误
-            }
-
-            return null;
+            const rpid = threadRenderer?.__data?.rpid;
+            if (!rpid) return null;
+            return rpid.toString();
         }
 
         extractVideoId() {
-            // 方法1: 从URL提取
-            const url = window.location.href;
-            const match = url.match(/\/video\/(?:av(\d+)|BV([a-zA-Z0-9]+))/);
-
-            if (match) {
-                if (match[1]) {
-                    // av号直接返回
-                    return match[1];
-                } else if (match[2]) {
-                    // BV号需要转换，但先尝试从页面数据获取对应的aid
-                    const aid = this.getAidFromPageData();
-                    if (aid) {
-                        return aid;
-                    }
-                    // 如果无法获取aid，返回BV号（某些API可能支持）
-                    return match[2];
-                }
-            }
-
-            // 方法2: 从页面数据获取
-            const aid = this.getAidFromPageData();
-            if (aid) {
-                return aid;
-            }
-
-            // 方法3: 从meta标签获取
-            const metaAid = document.querySelector('meta[property="og:url"]');
-            if (metaAid) {
-                const metaMatch = metaAid.content.match(/\/video\/av(\d+)/);
-                if (metaMatch) {
-                    return metaMatch[1];
-                }
-            }
-
-            return null;
-        }
-
-        getAidFromPageData() {
-            try {
-                // 尝试多种可能的全局变量
-                const sources = [
-                    () => window.__INITIAL_STATE__?.videoData?.aid,
-                    () => window.__initialState__?.videoData?.aid,
-                    () => window.__INITIAL_STATE__?.aid,
-                    () => window.__initialState__?.aid,
-                    () => window.aid,
-                    () => {
-                        // 从页面中的script标签查找
-                        const scripts = document.querySelectorAll('script');
-                        for (const script of scripts) {
-                            const content = script.textContent || '';
-                            const aidMatch = content.match(/"aid":(\d+)/);
-                            if (aidMatch) {
-                                return aidMatch[1];
-                            }
-                        }
-                        return null;
-                    }
-                ];
-
-                for (const source of sources) {
-                    const aid = source();
-                    if (aid) {
-                        return aid.toString();
-                    }
-                }
-            } catch (error) {
-                // 静默处理错误
-            }
-
-            return null;
+            const aid = window.__INITIAL_STATE__?.aid;
+            if (!aid) return null;
+            return aid.toString();
         }
 
 
@@ -1286,71 +1013,18 @@
                 // 显示加载提示
                 this.showLoadingIndicator();
 
-                // 尝试从按钮文本和周围元素中提取回复数量
-                const buttonText = commentInfo.container.textContent || '';
-
-                // 尝试多种模式匹配回复数量
-                let replyCount = 0;
-                const patterns = [
-                    /(\d+)\s*条回复/,
-                    /共\s*(\d+)\s*条/,
-                    /(\d+)\s*回复/,
-                    /(\d+)\s*replies?/i
-                ];
-
-                for (const pattern of patterns) {
-                    const match = buttonText.match(pattern);
-                    if (match) {
-                        replyCount = parseInt(match[1], 10);
-                        break;
-                    }
+                if (!commentInfo.rootId || !commentInfo.oid) {
+                    throw new Error('评论信息不完整');
                 }
 
-                // 如果按钮文本中没有找到，尝试从父元素中查找
-                if (replyCount === 0) {
-                    const parentText = commentInfo.commentElement?.textContent || '';
-                    for (const pattern of patterns) {
-                        const match = parentText.match(pattern);
-                        if (match) {
-                            replyCount = parseInt(match[1], 10);
-                            break;
-                        }
-                    }
-                }
-
-                // 尝试从__data中获取回复数量
-                if (replyCount === 0 && commentInfo.commentElement?.__data?.rcount) {
-                    replyCount = commentInfo.commentElement.__data.rcount;
-                    Utils.log('info', `从__data获取到回复数量: ${replyCount}`);
-                }
-
-                // 获取真实的评论回复数据
-                let realReplies = [];
-                let apiError = null;
-
-                // 只要有评论ID和视频ID就尝试调用API，不依赖回复数量检测
-                if (commentInfo.rootId && commentInfo.oid && commentInfo.rootId !== 'unknown') {
-                    try {
-                        Utils.log('info', `开始获取回复数据: oid=${commentInfo.oid}, rootId=${commentInfo.rootId}, 预期回复数=${replyCount}`);
-                        realReplies = await this.commentAPI.getAllReplies(commentInfo.oid, commentInfo.rootId);
-                        Utils.log('info', `成功获取 ${realReplies.length} 条真实回复数据`);
-
-                        // 如果API返回了数据，更新回复数量
-                        if (realReplies.length > 0 && replyCount === 0) {
-                            replyCount = realReplies.length;
-                            Utils.log('info', `根据API结果更新回复数量: ${replyCount}`);
-                        }
-                    } catch (error) {
-                        Utils.log('error', '获取真实回复数据失败:', error);
-                        apiError = error;
-                    }
-                } else {
-                    Utils.log('warn', `跳过API调用: rootId=${commentInfo?.rootId}, oid=${commentInfo?.oid}, replyCount=${replyCount}`);
-                }
+                Utils.log('info', `开始获取回复数据: oid=${commentInfo.oid}, rootId=${commentInfo.rootId}`);
+                const realReplies = await this.commentAPI.getAllReplies(commentInfo.oid, commentInfo.rootId);
+                const replyCount = realReplies.length;
+                Utils.log('info', `成功获取 ${realReplies.length} 条真实回复数据`);
 
                 // 创建评论展开弹出框，传入真实数据
-                Utils.log('info', `创建弹出框: replyCount=${replyCount}, realReplies.length=${realReplies.length}, hasError=${!!apiError}`);
-                this.createExpandModal(replyCount, buttonText, commentInfo, realReplies, apiError);
+                Utils.log('info', `创建弹出框: replyCount=${replyCount}, realReplies.length=${realReplies.length}`);
+                this.createExpandModal(replyCount, realReplies);
 
                 // 隐藏加载提示
                 this.hideLoadingIndicator();
@@ -1387,7 +1061,7 @@
             }
         }
 
-        createExpandModal(replyCount, buttonText, commentInfo, realReplies = [], apiError = null) {
+        createExpandModal(replyCount, realReplies = []) {
             // 创建遮罩层
             const overlay = document.createElement('div');
             overlay.style.cssText = `
@@ -1483,71 +1157,7 @@
                 text-align: left;
             `;
 
-            // 根据是否有真实数据来显示不同内容
-            if (realReplies && realReplies.length > 0) {
-                // 显示真实的回复数据
-                this.renderRepliesContent(body, realReplies, replyCount);
-            } else if (replyCount > 0) {
-                // 显示加载失败或无数据的提示 - 暗色主题
-                const errorMsg = apiError ? apiError.message : '未知错误';
-                body.innerHTML = `
-                    <div style="padding: 40px 20px; color: #e1e2e3;">
-                        <div style="text-align: center; margin-bottom: 30px;">
-                            <p style="color: #ff6b6b; margin-bottom: 16px; font-size: 16px;">⚠️ 无法获取回复数据</p>
-                            <p style="color: #9499a0; margin-bottom: 8px;">检测到 ${replyCount} 条回复，但API请求失败</p>
-                            <p style="color: #9499a0; margin-bottom: 20px;">按钮文本: "${buttonText}"</p>
-                        </div>
-                        <details style="margin: 20px 0; max-width: 600px; margin-left: auto; margin-right: auto;">
-                            <summary style="cursor: pointer; color: #ff6b6b; padding: 8px; border-radius: 4px; background: #2a2a2a; text-align: center;">错误详情 (点击展开)</summary>
-                            <div style="margin-top: 12px; font-size: 12px; background: #2a2a2a; padding: 16px; border-radius: 6px; border: 1px solid #3a3a3a; color: #e1e2e3; text-align: left;">
-                                <p style="margin-bottom: 8px;"><strong style="color: #ff6b6b;">错误信息:</strong> ${errorMsg}</p>
-                                <p style="margin-bottom: 8px;"><strong style="color: #00a1d6;">评论ID:</strong> ${commentInfo?.rootId || '未获取到'}</p>
-                                <p style="margin-bottom: 8px;"><strong style="color: #00a1d6;">视频ID:</strong> ${commentInfo?.oid || '未获取到'}</p>
-                                <p style="margin-bottom: 0;"><strong style="color: #00a1d6;">API URL:</strong> <code style="background: #1f1f1f; padding: 2px 4px; border-radius: 3px; font-size: 11px;">${CONFIG.API_BASE}/x/v2/reply/reply?type=${CONFIG.COMMENT_TYPE}&oid=${commentInfo?.oid}&root=${commentInfo?.rootId}</code></p>
-                            </div>
-                        </details>
-                        <div style="text-align: center;">
-                            <p style="color: #9499a0; font-size: 12px; margin-top: 20px; line-height: 1.5;">
-                                可能原因：网络问题、API限制、需要登录或评论ID提取失败
-                            </p>
-                            <p style="color: #00a1d6; margin-top: 16px; font-weight: 500;">✅ 基础架构已完成</p>
-                        </div>
-                    </div>
-                `;
-            } else {
-                // 显示调试信息 - 暗色主题
-                const parentText = commentInfo.commentElement?.textContent || '';
-                const containerHTML = commentInfo.container?.outerHTML?.substring(0, 200) || '';
-
-                body.innerHTML = `
-                    <div style="padding: 40px 20px; color: #e1e2e3;">
-                        <div style="text-align: center; margin-bottom: 30px;">
-                            <p style="font-size: 18px; margin-bottom: 16px; color: #9499a0;">暂无回复数据</p>
-                            <p style="color: #9499a0; margin-bottom: 20px;">按钮文本: "${buttonText}"</p>
-                        </div>
-                        <details style="margin: 20px 0; max-width: 600px; margin-left: auto; margin-right: auto;">
-                            <summary style="cursor: pointer; color: #00a1d6; padding: 8px; border-radius: 4px; background: #2a2a2a; text-align: center;">调试信息 (点击展开)</summary>
-                            <div style="margin-top: 12px; font-size: 12px; background: #2a2a2a; padding: 16px; border-radius: 6px; border: 1px solid #3a3a3a; color: #e1e2e3; text-align: left;">
-                                <p style="margin-bottom: 12px;"><strong style="color: #00a1d6;">父元素文本:</strong></p>
-                                <p style="word-break: break-all; max-height: 100px; overflow-y: auto; background: #1f1f1f; padding: 8px; border-radius: 4px; margin-bottom: 12px; font-family: monospace; font-size: 11px;">${parentText.substring(0, 300)}...</p>
-                                <p style="margin-bottom: 12px;"><strong style="color: #00a1d6;">容器HTML:</strong></p>
-                                <p style="word-break: break-all; max-height: 100px; overflow-y: auto; background: #1f1f1f; padding: 8px; border-radius: 4px; font-family: monospace; font-size: 11px;">${containerHTML}...</p>
-                            </div>
-                        </details>
-                        <div style="text-align: center;">
-                            <p style="color: #00a1d6; margin-bottom: 12px; font-weight: 500;">脚本已成功工作！</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 成功找到并处理"点击查看"按钮</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 弹出框功能完全正常</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 基础架构已完成</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 用户名点击跳转功能</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 视频链接识别功能</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 时间排序正序/倒序切换</p>
-                            <p style="color: #52c41a; margin-bottom: 8px;">✅ 独立瀑布流按钮</p>
-                            <p style="color: #00a1d6; margin-top: 16px; font-size: 14px;">Bilibili评论瀑布流 - 排序功能已优化</p>
-                        </div>
-                    </div>
-                `;
-            }
+            this.renderRepliesContent(body, realReplies, replyCount);
 
             modal.appendChild(header);
             modal.appendChild(body);
@@ -1700,40 +1310,14 @@
 
         buildReplyFloorMap(replies) {
             const floorMap = new Map();
-            const usedFloors = new Set();
 
             // 优先使用接口直接返回的楼层字段
             replies.forEach(reply => {
                 const apiFloor = Number(reply?.floor ?? reply?.reply_control?.floor);
                 if (Number.isFinite(apiFloor) && apiFloor > 0) {
-                    const normalizedFloor = Math.floor(apiFloor);
-                    floorMap.set(reply, { value: normalizedFloor, source: 'api' });
-                    usedFloors.add(normalizedFloor);
+                    floorMap.set(reply, { value: Math.floor(apiFloor), source: 'api' });
                 }
             });
-
-            // 对缺失楼层的回复，按时间顺序补齐稳定楼层号
-            const missingReplies = replies.filter(reply => !floorMap.has(reply));
-            if (missingReplies.length > 0) {
-                const sortedByTime = [...missingReplies].sort((a, b) => {
-                    const timeA = Number(a?.ctime || 0);
-                    const timeB = Number(b?.ctime || 0);
-                    if (timeA !== timeB) {
-                        return timeA - timeB;
-                    }
-                    return Number(a?.rpid || 0) - Number(b?.rpid || 0);
-                });
-
-                let floor = 1;
-                sortedByTime.forEach(reply => {
-                    while (usedFloors.has(floor)) {
-                        floor++;
-                    }
-                    floorMap.set(reply, { value: floor, source: 'computed' });
-                    usedFloors.add(floor);
-                    floor++;
-                });
-            }
 
             return floorMap;
         }
@@ -1873,7 +1457,7 @@
                     white-space: nowrap;
                 `;
                 floorTag.textContent = `${floorInfo.value}楼`;
-                floorTag.title = floorInfo.source === 'api' ? '接口返回楼层' : '根据回复时间顺序计算的楼层';
+                floorTag.title = '接口返回楼层';
                 userInfo.appendChild(floorTag);
             }
 
@@ -1891,18 +1475,17 @@
             // 处理评论内容中的视频链接 - 使用增强版
             // 先显示原始内容，然后异步加载视频标题
             const originalContent = reply.content?.message || '';
+            const replyEmoteData = reply.content?.emote || null;
             messageDiv.textContent = originalContent;
 
             // 异步处理视频链接
-            Utils.processCommentContentEnhanced(originalContent).then(processedContent => {
+            Utils.processCommentContentEnhanced(originalContent, replyEmoteData).then(processedContent => {
                 messageDiv.innerHTML = processedContent;
                 // 为增强版视频链接添加悬停效果
                 Utils.addEnhancedVideoLinkHoverEffects(messageDiv);
-            }).catch(() => {
-                // 如果失败，使用简单版本
-                const simpleProcessed = Utils.processCommentContent(originalContent);
-                messageDiv.innerHTML = simpleProcessed;
-                Utils.addVideoLinkHoverEffects(messageDiv);
+            }).catch((error) => {
+                Utils.log('error', '处理评论内容失败', error);
+                messageDiv.textContent = originalContent;
             });
 
             // 互动信息 - 模仿Bilibili原生样式
