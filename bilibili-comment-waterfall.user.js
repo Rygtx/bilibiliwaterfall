@@ -1062,6 +1062,30 @@
         }
 
         createExpandModal(replyCount, realReplies = []) {
+            const docStyle = document.documentElement.style;
+            const bodyStyle = document.body.style;
+            const previousDocStyle = {
+                overflow: docStyle.overflow,
+                overscrollBehavior: docStyle.overscrollBehavior
+            };
+            const previousBodyStyle = {
+                overflow: bodyStyle.overflow,
+                position: bodyStyle.position,
+                top: bodyStyle.top,
+                width: bodyStyle.width,
+                overscrollBehavior: bodyStyle.overscrollBehavior
+            };
+            const lockedScrollY = window.scrollY || window.pageYOffset || 0;
+
+            // 打开弹窗时锁定页面滚动，避免背景滚动
+            docStyle.overflow = 'hidden';
+            docStyle.overscrollBehavior = 'none';
+            bodyStyle.overflow = 'hidden';
+            bodyStyle.position = 'fixed';
+            bodyStyle.top = `-${lockedScrollY}px`;
+            bodyStyle.width = '100%';
+            bodyStyle.overscrollBehavior = 'none';
+
             // 创建遮罩层
             const overlay = document.createElement('div');
             overlay.style.cssText = `
@@ -1076,6 +1100,7 @@
                 align-items: center;
                 justify-content: center;
                 backdrop-filter: blur(4px);
+                overscroll-behavior: contain;
             `;
 
             // 创建弹出框 - 暗色主题，模仿Bilibili原生设计
@@ -1132,7 +1157,6 @@
                 transition: all 0.2s ease;
             `;
             closeButton.textContent = '×';
-            closeButton.onclick = () => overlay.remove();
 
             // 关闭按钮悬停效果
             closeButton.onmouseover = () => {
@@ -1163,21 +1187,50 @@
             modal.appendChild(body);
             overlay.appendChild(modal);
 
+            const restoreBackgroundScroll = () => {
+                docStyle.overflow = previousDocStyle.overflow;
+                docStyle.overscrollBehavior = previousDocStyle.overscrollBehavior;
+                bodyStyle.overflow = previousBodyStyle.overflow;
+                bodyStyle.position = previousBodyStyle.position;
+                bodyStyle.top = previousBodyStyle.top;
+                bodyStyle.width = previousBodyStyle.width;
+                bodyStyle.overscrollBehavior = previousBodyStyle.overscrollBehavior;
+                window.scrollTo(0, lockedScrollY);
+            };
+
+            const closeModal = () => {
+                document.removeEventListener('keydown', escHandler);
+                if (overlay.parentNode) {
+                    overlay.remove();
+                }
+                restoreBackgroundScroll();
+            };
+
+            closeButton.onclick = closeModal;
+
             // 点击遮罩层关闭
             overlay.onclick = (e) => {
                 if (e.target === overlay) {
-                    overlay.remove();
+                    closeModal();
                 }
             };
 
             // ESC键关闭
             const escHandler = (e) => {
                 if (e.key === 'Escape') {
-                    overlay.remove();
-                    document.removeEventListener('keydown', escHandler);
+                    closeModal();
                 }
             };
             document.addEventListener('keydown', escHandler);
+
+            // 避免滚动事件穿透到背景页面
+            const preventBackgroundScroll = (e) => {
+                if (e.target === overlay) {
+                    e.preventDefault();
+                }
+            };
+            overlay.addEventListener('wheel', preventBackgroundScroll, { passive: false });
+            overlay.addEventListener('touchmove', preventBackgroundScroll, { passive: false });
 
             document.body.appendChild(overlay);
         }
@@ -1473,20 +1526,24 @@
             `;
 
             // 处理评论内容中的视频链接 - 使用增强版
-            // 先显示原始内容，然后异步加载视频标题
+            // 先同步渲染文本+表情，避免被视频标题请求阻塞
             const originalContent = reply.content?.message || '';
             const replyEmoteData = reply.content?.emote || null;
-            messageDiv.textContent = originalContent;
+            const escapedContent = Utils.escapeHtml(originalContent);
+            messageDiv.innerHTML = Utils.processEmoticons(escapedContent, replyEmoteData);
 
-            // 异步处理视频链接
-            Utils.processCommentContentEnhanced(originalContent, replyEmoteData).then(processedContent => {
-                messageDiv.innerHTML = processedContent;
-                // 为增强版视频链接添加悬停效果
-                Utils.addEnhancedVideoLinkHoverEffects(messageDiv);
-            }).catch((error) => {
-                Utils.log('error', '处理评论内容失败', error);
-                messageDiv.textContent = originalContent;
-            });
+            const hasVideoReference = /(?:https?:\/\/(?:www\.)?(?:b23\.tv\/|bilibili\.com\/video\/)|\bav\d+\b|\bBV[a-zA-Z0-9]+\b)/i.test(originalContent);
+            if (hasVideoReference) {
+                // 异步处理视频链接（完成后覆盖为完整内容）
+                Utils.processCommentContentEnhanced(originalContent, replyEmoteData).then(processedContent => {
+                    messageDiv.innerHTML = processedContent;
+                    // 为增强版视频链接添加悬停效果
+                    Utils.addEnhancedVideoLinkHoverEffects(messageDiv);
+                }).catch((error) => {
+                    Utils.log('error', '处理评论内容失败', error);
+                    messageDiv.innerHTML = Utils.processEmoticons(Utils.escapeHtml(originalContent), replyEmoteData);
+                });
+            }
 
             // 互动信息 - 模仿Bilibili原生样式
             const actions = document.createElement('div');
