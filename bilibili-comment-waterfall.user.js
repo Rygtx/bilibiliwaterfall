@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    http://tampermonkey.net/
-// @version      2.4.0
+// @version      2.5.0
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
@@ -1066,25 +1066,27 @@
             const bodyStyle = document.body.style;
             const previousDocStyle = {
                 overflow: docStyle.overflow,
-                overscrollBehavior: docStyle.overscrollBehavior
+                overscrollBehavior: docStyle.overscrollBehavior,
+                scrollBehavior: docStyle.scrollBehavior
             };
             const previousBodyStyle = {
                 overflow: bodyStyle.overflow,
-                position: bodyStyle.position,
-                top: bodyStyle.top,
-                width: bodyStyle.width,
-                overscrollBehavior: bodyStyle.overscrollBehavior
+                overscrollBehavior: bodyStyle.overscrollBehavior,
+                scrollBehavior: bodyStyle.scrollBehavior,
+                paddingRight: bodyStyle.paddingRight
             };
-            const lockedScrollY = window.scrollY || window.pageYOffset || 0;
+            const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
 
             // 打开弹窗时锁定页面滚动，避免背景滚动
             docStyle.overflow = 'hidden';
             docStyle.overscrollBehavior = 'none';
+            docStyle.scrollBehavior = 'auto';
             bodyStyle.overflow = 'hidden';
-            bodyStyle.position = 'fixed';
-            bodyStyle.top = `-${lockedScrollY}px`;
-            bodyStyle.width = '100%';
             bodyStyle.overscrollBehavior = 'none';
+            bodyStyle.scrollBehavior = 'auto';
+            if (scrollbarWidth > 0) {
+                bodyStyle.paddingRight = `${scrollbarWidth}px`;
+            }
 
             // 创建遮罩层
             const overlay = document.createElement('div');
@@ -1181,7 +1183,7 @@
                 text-align: left;
             `;
 
-            this.renderRepliesContent(body, realReplies, replyCount);
+            const repliesViewController = this.renderRepliesContent(body, realReplies, replyCount, modal, overlay);
 
             modal.appendChild(header);
             modal.appendChild(body);
@@ -1191,19 +1193,25 @@
                 docStyle.overflow = previousDocStyle.overflow;
                 docStyle.overscrollBehavior = previousDocStyle.overscrollBehavior;
                 bodyStyle.overflow = previousBodyStyle.overflow;
-                bodyStyle.position = previousBodyStyle.position;
-                bodyStyle.top = previousBodyStyle.top;
-                bodyStyle.width = previousBodyStyle.width;
                 bodyStyle.overscrollBehavior = previousBodyStyle.overscrollBehavior;
-                window.scrollTo(0, lockedScrollY);
+                bodyStyle.paddingRight = previousBodyStyle.paddingRight;
+
+                // 在恢复位置后再还原滚动行为，避免出现平滑回滚动画
+                requestAnimationFrame(() => {
+                    docStyle.scrollBehavior = previousDocStyle.scrollBehavior;
+                    bodyStyle.scrollBehavior = previousBodyStyle.scrollBehavior;
+                });
             };
 
             const closeModal = () => {
                 document.removeEventListener('keydown', escHandler);
+                if (repliesViewController && typeof repliesViewController.destroy === 'function') {
+                    repliesViewController.destroy();
+                }
+                restoreBackgroundScroll();
                 if (overlay.parentNode) {
                     overlay.remove();
                 }
-                restoreBackgroundScroll();
             };
 
             closeButton.onclick = closeModal;
@@ -1235,8 +1243,14 @@
             document.body.appendChild(overlay);
         }
 
-        renderRepliesContent(container, replies, totalCount) {
+        renderRepliesContent(container, replies, totalCount, modalElement = null, overlayElement = null) {
             const replyFloorMap = this.buildReplyFloorMap(replies);
+            const replyIndex = this.buildReplyIndex(replies);
+
+            container.style.display = 'flex';
+            container.style.flexDirection = 'column';
+            container.style.minHeight = '0';
+            container.style.overflow = 'hidden';
 
             // 创建排序控制 - 暗色主题
             const sortControls = document.createElement('div');
@@ -1265,27 +1279,184 @@
             sortControls.appendChild(sortInfo);
             sortControls.appendChild(sortButtons);
 
-            // 创建回复列表容器 - 暗色主题
+            // 回复列表容器 - 暗色主题
             const repliesContainer = document.createElement('div');
             repliesContainer.style.cssText = `
                 flex: 1;
+                min-width: 0;
                 overflow-y: auto;
                 padding: 0;
                 background: #1f1f1f;
             `;
 
+            // 对话链侧边浮层（不占用原列表布局）
+            const conversationPanel = document.createElement('div');
+            conversationPanel.style.cssText = `
+                position: fixed;
+                width: 340px;
+                max-width: min(92vw, 360px);
+                min-width: 280px;
+                border: 1px solid #3a3a3a;
+                background: #181818;
+                display: none;
+                flex-direction: column;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+                z-index: 10002;
+            `;
+
+            const conversationHeader = document.createElement('div');
+            conversationHeader.style.cssText = `
+                padding: 12px 14px;
+                border-bottom: 1px solid #3a3a3a;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            `;
+
+            const conversationTitle = document.createElement('span');
+            conversationTitle.style.cssText = `
+                color: #e1e2e3;
+                font-size: 13px;
+                font-weight: 600;
+            `;
+            conversationTitle.textContent = '回复对话';
+
+            const conversationCloseBtn = document.createElement('button');
+            conversationCloseBtn.type = 'button';
+            conversationCloseBtn.style.cssText = `
+                border: 1px solid #4a4a4a;
+                background: #2a2a2a;
+                color: #9499a0;
+                border-radius: 4px;
+                font-size: 12px;
+                padding: 2px 8px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+            `;
+            conversationCloseBtn.textContent = '关闭';
+            conversationCloseBtn.onmouseover = () => {
+                conversationCloseBtn.style.borderColor = '#00a1d6';
+                conversationCloseBtn.style.color = '#00a1d6';
+            };
+            conversationCloseBtn.onmouseout = () => {
+                conversationCloseBtn.style.borderColor = '#4a4a4a';
+                conversationCloseBtn.style.color = '#9499a0';
+            };
+
+            const conversationBody = document.createElement('div');
+            conversationBody.style.cssText = `
+                flex: 1;
+                min-height: 0;
+                overflow-y: auto;
+                padding: 12px;
+                background: #181818;
+            `;
+
+            conversationHeader.appendChild(conversationTitle);
+            conversationHeader.appendChild(conversationCloseBtn);
+            conversationPanel.appendChild(conversationHeader);
+            conversationPanel.appendChild(conversationBody);
+
+            const panelHost = overlayElement || document.body;
+            panelHost.appendChild(conversationPanel);
+
             // 初始化排序状态
             let currentSort = 'hot';
             let timeOrder = 'desc'; // 'desc' 为倒序（最新在前），'asc' 为正序（最旧在前）
+            let activeConversationReplyId = '';
+            const panelGap = 12;
+            const panelMargin = 12;
+
+            const positionConversationPanel = () => {
+                if (!modalElement) {
+                    conversationPanel.style.right = `${panelMargin}px`;
+                    conversationPanel.style.top = `${panelMargin}px`;
+                    conversationPanel.style.height = `${Math.max(260, Math.floor(window.innerHeight * 0.7))}px`;
+                    return;
+                }
+
+                const modalRect = modalElement.getBoundingClientRect();
+                const panelWidth = Math.min(360, Math.max(280, conversationPanel.offsetWidth || 340));
+                let left = modalRect.right + panelGap;
+
+                if (left + panelWidth + panelMargin > window.innerWidth) {
+                    left = modalRect.left - panelGap - panelWidth;
+                }
+                if (left < panelMargin) {
+                    left = Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin);
+                }
+
+                const top = Math.max(panelMargin, Math.min(modalRect.top, window.innerHeight - 220));
+                const maxHeight = Math.max(160, window.innerHeight - top - panelMargin);
+                const preferredHeight = Math.max(260, Math.min(modalRect.height, Math.floor(window.innerHeight * 0.8)));
+                const height = Math.min(preferredHeight, maxHeight);
+
+                conversationPanel.style.left = `${Math.round(left)}px`;
+                conversationPanel.style.top = `${Math.round(top)}px`;
+                conversationPanel.style.height = `${Math.round(height)}px`;
+                conversationPanel.style.right = '';
+            };
+
+            const onViewportChange = () => {
+                if (conversationPanel.style.display !== 'none') {
+                    positionConversationPanel();
+                }
+            };
+            window.addEventListener('resize', onViewportChange);
+
+            const renderReplies = () => {
+                this.renderRepliesList(
+                    repliesContainer,
+                    replies,
+                    currentSort,
+                    timeOrder,
+                    replyFloorMap,
+                    handleViewConversation,
+                    activeConversationReplyId
+                );
+            };
+
+            const hideConversationPanel = () => {
+                activeConversationReplyId = '';
+                conversationPanel.style.display = 'none';
+                conversationTitle.textContent = '回复对话';
+                conversationBody.innerHTML = '';
+                renderReplies();
+            };
+
+            const handleViewConversation = (reply) => {
+                const selectedReplyId = this.getReplyId(reply);
+                if (!selectedReplyId) {
+                    return;
+                }
+
+                const chain = this.buildReplyChain(reply, replyIndex);
+                if (chain.length === 0) {
+                    return;
+                }
+
+                activeConversationReplyId = selectedReplyId;
+                conversationTitle.textContent = `回复对话 (${chain.length}层)`;
+                this.renderReplyChainPanel(conversationBody, chain, selectedReplyId);
+                conversationPanel.style.display = 'flex';
+                positionConversationPanel();
+                requestAnimationFrame(positionConversationPanel);
+                renderReplies();
+            };
+
+            conversationCloseBtn.onclick = hideConversationPanel;
 
             // 渲染回复列表
-            this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder, replyFloorMap);
+            renderReplies();
 
             // 绑定排序事件
             hotSortBtn.onclick = () => {
                 currentSort = 'hot';
                 this.updateSortButtons(hotSortBtn, timeSortBtn);
-                this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder, replyFloorMap);
+                renderReplies();
             };
 
             timeSortBtn.onclick = () => {
@@ -1302,11 +1473,20 @@
                 timeSortBtn.textContent = `按时间${timeOrder === 'desc' ? '↓' : '↑'}`;
 
                 this.updateSortButtons(timeSortBtn, hotSortBtn);
-                this.renderRepliesList(repliesContainer, replies, currentSort, timeOrder, replyFloorMap);
+                renderReplies();
             };
 
             container.appendChild(sortControls);
             container.appendChild(repliesContainer);
+
+            return {
+                destroy: () => {
+                    window.removeEventListener('resize', onViewportChange);
+                    if (conversationPanel.parentNode) {
+                        conversationPanel.remove();
+                    }
+                }
+            };
         }
 
         createSortButton(text, active) {
@@ -1375,7 +1555,162 @@
             return floorMap;
         }
 
-        renderRepliesList(container, replies, sortType, timeOrder = 'desc', replyFloorMap = new Map()) {
+        getReplyId(reply) {
+            const rpid = reply?.rpid;
+            return rpid === undefined || rpid === null ? '' : String(rpid);
+        }
+
+        getParentReplyId(reply) {
+            const parent = reply?.parent;
+            return parent === undefined || parent === null ? '' : String(parent);
+        }
+
+        getRootReplyId(reply) {
+            const root = reply?.root;
+            return root === undefined || root === null ? '' : String(root);
+        }
+
+        isReplyToAnotherComment(reply) {
+            const replyId = this.getReplyId(reply);
+            const parentId = this.getParentReplyId(reply);
+            const rootId = this.getRootReplyId(reply);
+            return Boolean(parentId && parentId !== rootId && parentId !== replyId);
+        }
+
+        buildReplyIndex(replies) {
+            const replyIndex = new Map();
+            replies.forEach(reply => {
+                const replyId = this.getReplyId(reply);
+                if (replyId) {
+                    replyIndex.set(replyId, reply);
+                }
+            });
+            return replyIndex;
+        }
+
+        buildReplyChain(selectedReply, replyIndex) {
+            const chain = [];
+            if (!selectedReply) {
+                return chain;
+            }
+
+            const visited = new Set();
+            let cursor = selectedReply;
+
+            while (cursor) {
+                const cursorId = this.getReplyId(cursor);
+                if (!cursorId || visited.has(cursorId)) {
+                    break;
+                }
+
+                visited.add(cursorId);
+                chain.unshift(cursor);
+
+                const parentId = this.getParentReplyId(cursor);
+                const rootId = this.getRootReplyId(cursor);
+                if (!parentId || parentId === rootId || parentId === cursorId) {
+                    break;
+                }
+
+                cursor = replyIndex.get(parentId) || null;
+            }
+
+            return chain;
+        }
+
+        renderReplyChainPanel(container, chain, activeReplyId) {
+            container.innerHTML = '';
+
+            chain.forEach((reply, index) => {
+                if (index > 0) {
+                    const arrow = document.createElement('div');
+                    arrow.style.cssText = `
+                        color: #6b6f76;
+                        text-align: center;
+                        margin: 4px 0;
+                        font-size: 12px;
+                    `;
+                    arrow.textContent = '↓';
+                    container.appendChild(arrow);
+                }
+
+                const replyId = this.getReplyId(reply);
+                const isCurrent = replyId === activeReplyId;
+                const card = document.createElement('div');
+                card.style.cssText = `
+                    border: 1px solid ${isCurrent ? 'rgba(0, 161, 214, 0.45)' : '#353535'};
+                    background: ${isCurrent ? 'rgba(0, 161, 214, 0.08)' : '#202020'};
+                    border-radius: 8px;
+                    padding: 10px 12px;
+                `;
+
+                const header = document.createElement('div');
+                header.style.cssText = `
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    margin-bottom: 8px;
+                    font-size: 12px;
+                    color: #9499a0;
+                `;
+
+                const username = document.createElement('span');
+                username.style.cssText = `
+                    color: #e1e2e3;
+                    font-weight: 600;
+                    max-width: 120px;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                `;
+                username.textContent = reply.member?.uname || '匿名用户';
+
+                const time = document.createElement('span');
+                time.textContent = Utils.formatTime(reply.ctime);
+
+                header.appendChild(username);
+                header.appendChild(time);
+
+                if (isCurrent) {
+                    const tag = document.createElement('span');
+                    tag.style.cssText = `
+                        margin-left: auto;
+                        color: #40a9ff;
+                        border: 1px solid rgba(64, 169, 255, 0.5);
+                        border-radius: 999px;
+                        padding: 1px 6px;
+                        font-size: 11px;
+                    `;
+                    tag.textContent = '当前回复';
+                    header.appendChild(tag);
+                }
+
+                const message = document.createElement('div');
+                message.style.cssText = `
+                    color: #d0d2d6;
+                    font-size: 13px;
+                    line-height: 1.5;
+                    word-break: break-word;
+                `;
+                const originalContent = reply.content?.message || '';
+                const replyEmoteData = reply.content?.emote || null;
+                message.innerHTML = Utils.processEmoticons(Utils.escapeHtml(originalContent), replyEmoteData);
+
+                card.appendChild(header);
+                card.appendChild(message);
+                container.appendChild(card);
+            });
+        }
+
+        renderRepliesList(
+            container,
+            replies,
+            sortType,
+            timeOrder = 'desc',
+            replyFloorMap = new Map(),
+            onViewConversation = null,
+            activeConversationReplyId = ''
+        ) {
             // 排序回复
             const sortedReplies = [...replies].sort((a, b) => {
                 if (sortType === 'hot') {
@@ -1394,12 +1729,17 @@
             // 渲染每条回复
             sortedReplies.forEach((reply) => {
                 const floorInfo = replyFloorMap.get(reply) || null;
-                const replyElement = this.createReplyElement(reply, floorInfo);
+                const replyElement = this.createReplyElement(
+                    reply,
+                    floorInfo,
+                    onViewConversation,
+                    activeConversationReplyId
+                );
                 container.appendChild(replyElement);
             });
         }
 
-        createReplyElement(reply, floorInfo = null) {
+        createReplyElement(reply, floorInfo = null, onViewConversation = null, activeConversationReplyId = '') {
             const replyDiv = document.createElement('div');
             replyDiv.style.cssText = `
                 padding: 16px 20px;
@@ -1410,12 +1750,19 @@
                 background: #1f1f1f;
             `;
 
+            const replyId = this.getReplyId(reply);
+            const isConversationActive = activeConversationReplyId && replyId === activeConversationReplyId;
+            if (activeConversationReplyId && replyId === activeConversationReplyId) {
+                replyDiv.style.boxShadow = 'inset 3px 0 0 #00a1d6';
+                replyDiv.style.background = '#252525';
+            }
+
             replyDiv.onmouseover = () => {
                 replyDiv.style.backgroundColor = '#2a2a2a';
             };
 
             replyDiv.onmouseout = () => {
-                replyDiv.style.backgroundColor = '#1f1f1f';
+                replyDiv.style.backgroundColor = isConversationActive ? '#252525' : '#1f1f1f';
             };
 
             // 用户头像 - 模仿Bilibili原生尺寸
@@ -1579,6 +1926,44 @@
 
             actions.appendChild(likeSpan);
 
+            if (this.isReplyToAnotherComment(reply) && typeof onViewConversation === 'function') {
+                const conversationBtn = document.createElement('button');
+                conversationBtn.type = 'button';
+                conversationBtn.textContent = '查看对话';
+                conversationBtn.style.cssText = `
+                    border: 1px solid ${isConversationActive ? '#00a1d6' : '#4a4a4a'};
+                    background: ${isConversationActive ? 'rgba(0, 161, 214, 0.12)' : '#2a2a2a'};
+                    color: ${isConversationActive ? '#40a9ff' : '#c9ccd1'};
+                    border-radius: 4px;
+                    font-size: 12px;
+                    padding: 4px 8px;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                `;
+
+                conversationBtn.onmouseover = () => {
+                    if (!isConversationActive) {
+                        conversationBtn.style.borderColor = '#00a1d6';
+                        conversationBtn.style.color = '#00a1d6';
+                    }
+                };
+
+                conversationBtn.onmouseout = () => {
+                    if (!isConversationActive) {
+                        conversationBtn.style.borderColor = '#4a4a4a';
+                        conversationBtn.style.color = '#c9ccd1';
+                    }
+                };
+
+                conversationBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onViewConversation(reply);
+                };
+
+                actions.appendChild(conversationBtn);
+            }
+
             content.appendChild(userInfo);
             content.appendChild(messageDiv);
             content.appendChild(actions);
@@ -1658,6 +2043,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论展开助手脚本 v2.3.0 已加载 - 优化按钮附加和用户体验');
+    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.0 已加载 - 优化按钮附加和用户体验');
 
 })();
