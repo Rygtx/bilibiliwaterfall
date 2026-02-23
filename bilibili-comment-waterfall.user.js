@@ -713,28 +713,22 @@
         // 查找评论展开按钮（优化版）
         findExpandButton(threadRenderer) {
             try {
-                // 优先在主要位置查找（基于实际使用情况优化）
-                const primaryLocations = [
-                    threadRenderer.shadowRoot?.querySelector("#replies"),
-                    threadRenderer
-                ];
-
-                for (const location of primaryLocations) {
-                    if (location) {
-                        // 直接查找按钮
-                        const expandBtn = location.querySelector?.('.bili-comment-expand-btn');
-                        if (expandBtn) {
-                            return expandBtn;
-                        }
-                        // 检查shadowRoot
-                        if (location.shadowRoot) {
-                            const expandBtn = location.shadowRoot.querySelector('.bili-comment-expand-btn');
-                            if (expandBtn) {
-                                return expandBtn;
-                            }
-                        }
-                    }
+                const repliesRenderer = threadRenderer.shadowRoot?.querySelector("#replies > bili-comment-replies-renderer");
+                const repliesShadowRoot = repliesRenderer?.shadowRoot;
+                if (!repliesShadowRoot) {
+                    return null;
                 }
+
+                const expanderFooter = repliesShadowRoot.querySelector("#expander-footer");
+                if (!expanderFooter) {
+                    return null;
+                }
+
+                const expandBtn = expanderFooter.querySelector('.bili-comment-expand-btn');
+                if (expandBtn) {
+                    return expandBtn;
+                }
+
                 return null;
             } catch (error) {
                 return null;
@@ -801,26 +795,54 @@
                 return;
             }
 
-            const targetContainer = threadRenderer.shadowRoot?.querySelector("#replies");
-            if (!targetContainer) {
-                throw new Error('未找到目标容器 #replies');
+            const repliesRenderer = threadRenderer.shadowRoot?.querySelector("#replies > bili-comment-replies-renderer");
+            const repliesShadowRoot = repliesRenderer?.shadowRoot;
+            if (!repliesShadowRoot) {
+                throw new Error('未找到评论回复渲染器 shadowRoot');
             }
 
+            const targetContainer = repliesShadowRoot.querySelector("#expander-footer");
+            if (!targetContainer) {
+                throw new Error('未找到目标容器 #expander-footer');
+            }
+            const viewMoreContainer = repliesShadowRoot.querySelector("#view-more");
+
             const expandBtn = this.createExpandButton(commentInfo);
-            const buttonWrapper = document.createElement('div');
+            const buttonWrapper = document.createElement('span');
             buttonWrapper.className = 'bili-comment-expand-wrapper';
             buttonWrapper.style.cssText = `
-                display: flex;
-                justify-content: center;
+                display: inline-flex;
                 align-items: center;
-                margin: 8px 0;
-                position: relative;
+                position: absolute;
+                left: 50%;
+                top: 50%;
+                transform: translate(-50%, -50%);
                 z-index: 1000;
-                width: 100%;
+                margin: 0;
             `;
             buttonWrapper.appendChild(expandBtn);
-            targetContainer.appendChild(buttonWrapper);
-            Utils.log('info', '评论展开按钮已添加到 #replies');
+
+            // 与 #view-more 保持同一行并列显示
+            targetContainer.style.position = 'relative';
+            targetContainer.style.display = 'flex';
+            targetContainer.style.flexDirection = 'row';
+            targetContainer.style.flexWrap = 'nowrap';
+            targetContainer.style.alignItems = 'center';
+            targetContainer.style.gap = '8px';
+            targetContainer.style.whiteSpace = 'nowrap';
+
+            if (viewMoreContainer && viewMoreContainer.parentElement === targetContainer) {
+                viewMoreContainer.style.display = 'inline-flex';
+                viewMoreContainer.style.width = 'auto';
+                viewMoreContainer.style.flex = '0 0 auto';
+                viewMoreContainer.style.alignSelf = 'center';
+                viewMoreContainer.style.margin = '0';
+                viewMoreContainer.insertAdjacentElement('afterend', buttonWrapper);
+            } else {
+                targetContainer.appendChild(buttonWrapper);
+            }
+
+            Utils.log('info', '评论展开按钮已添加到 #expander-footer，并与 #view-more 同行显示');
         }
 
         // 创建评论展开按钮（提取为独立方法）
@@ -828,7 +850,7 @@
             const expandBtn = document.createElement('button');
             expandBtn.className = 'bili-comment-expand-btn';
             expandBtn.style.cssText = `
-                padding: 8px 16px;
+                padding: 5px 16px;
                 background: linear-gradient(135deg, #00a1d6, #0084b4);
                 color: #ffffff;
                 border: 1px solid rgba(0, 161, 214, 0.3);
@@ -1111,9 +1133,9 @@
                 background: #1f1f1f;
                 border: 1px solid #3a3a3a;
                 border-radius: 8px;
-                width: 85%;
-                max-width: 900px;
-                max-height: 85%;
+                width: 92%;
+                max-width: 1200px;
+                max-height: 92%;
                 display: flex;
                 flex-direction: column;
                 box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
@@ -1443,7 +1465,10 @@
                 this.renderReplyChainPanel(conversationBody, chain, selectedReplyId);
                 conversationPanel.style.display = 'flex';
                 positionConversationPanel();
-                requestAnimationFrame(positionConversationPanel);
+                requestAnimationFrame(() => {
+                    positionConversationPanel();
+                    this.scrollConversationChainToCurrentReply(conversationBody);
+                });
                 renderReplies();
             };
 
@@ -1643,33 +1668,77 @@
                     border-radius: 8px;
                     padding: 10px 12px;
                 `;
+                card.setAttribute('data-current-reply', isCurrent ? 'true' : 'false');
 
                 const header = document.createElement('div');
                 header.style.cssText = `
                     display: flex;
                     align-items: center;
-                    gap: 8px;
+                    gap: 10px;
                     margin-bottom: 8px;
+                `;
+
+                const avatar = document.createElement('img');
+                avatar.style.cssText = `
+                    width: 30px;
+                    height: 30px;
+                    border-radius: 50%;
+                    flex-shrink: 0;
+                    object-fit: cover;
+                    border: 1px solid #3a3a3a;
+                `;
+                avatar.src = reply.member?.avatar || 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHZpZXdCb3g9IjAgMCA0MCA0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iMjAiIGN5PSIyMCIgcj0iMjAiIGZpbGw9IiM0YTRhNGEiLz4KPHRleHQgeD0iMjAiIHk9IjI2IiB0ZXh0LWFuY2hvcj0ibWlkZGxlIiBmb250LXNpemU9IjE0IiBmaWxsPSIjOTQ5OWEwIj7nlKg8L3RleHQ+Cjwvc3ZnPgo=';
+                avatar.alt = reply.member?.uname || '用户';
+
+                const meta = document.createElement('div');
+                meta.style.cssText = `
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    min-width: 0;
+                    flex: 1;
                     font-size: 12px;
                     color: #9499a0;
                 `;
 
                 const username = document.createElement('span');
+                const vipColor = reply.member?.vip?.nickname_color;
+                const userId = reply.member?.mid || reply.mid;
                 username.style.cssText = `
-                    color: #e1e2e3;
+                    color: ${vipColor || '#e1e2e3'};
                     font-weight: 600;
-                    max-width: 120px;
+                    max-width: 140px;
                     overflow: hidden;
                     text-overflow: ellipsis;
                     white-space: nowrap;
+                    transition: all 0.2s ease;
+                    border-bottom: 1px solid transparent;
                 `;
                 username.textContent = reply.member?.uname || '匿名用户';
+
+                if (userId) {
+                    username.style.cursor = 'pointer';
+                    username.onclick = (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const userUrl = `https://space.bilibili.com/${userId}`;
+                        window.open(userUrl, '_blank');
+                    };
+                    username.onmouseover = () => {
+                        username.style.borderBottomColor = vipColor || '#e1e2e3';
+                        username.style.color = vipColor || '#ffffff';
+                    };
+                    username.onmouseout = () => {
+                        username.style.borderBottomColor = 'transparent';
+                        username.style.color = vipColor || '#e1e2e3';
+                    };
+                }
 
                 const time = document.createElement('span');
                 time.textContent = Utils.formatTime(reply.ctime);
 
-                header.appendChild(username);
-                header.appendChild(time);
+                meta.appendChild(username);
+                meta.appendChild(time);
 
                 if (isCurrent) {
                     const tag = document.createElement('span');
@@ -1682,13 +1751,16 @@
                         font-size: 11px;
                     `;
                     tag.textContent = '当前回复';
-                    header.appendChild(tag);
+                    meta.appendChild(tag);
                 }
+
+                header.appendChild(avatar);
+                header.appendChild(meta);
 
                 const message = document.createElement('div');
                 message.style.cssText = `
                     color: #d0d2d6;
-                    font-size: 13px;
+                    font-size: 14px;
                     line-height: 1.5;
                     word-break: break-word;
                 `;
@@ -1700,6 +1772,20 @@
                 card.appendChild(message);
                 container.appendChild(card);
             });
+        }
+
+        scrollConversationChainToCurrentReply(container) {
+            if (!container) {
+                return;
+            }
+
+            const currentCard = container.querySelector('[data-current-reply="true"]');
+            if (!currentCard) {
+                return;
+            }
+
+            const targetTop = currentCard.offsetTop - (container.clientHeight - currentCard.offsetHeight) / 2;
+            container.scrollTop = Math.max(0, targetTop);
         }
 
         renderRepliesList(
@@ -1868,7 +1954,7 @@
                 line-height: 1.6;
                 margin-bottom: 12px;
                 word-break: break-word;
-                font-size: 14px;
+                font-size: 15px;
                 text-align: left;
             `;
 
