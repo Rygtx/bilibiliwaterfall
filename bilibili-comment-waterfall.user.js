@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    https://violentmonkey.github.io/
-// @version      2.5.2
+// @version      2.5.3
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
@@ -1361,11 +1361,6 @@
                 }
             };
 
-            overlay.onclick = (e) => {
-                if (e.target === overlay) {
-                    closeModal();
-                }
-            };
             cancelBtn.onclick = closeModal;
             saveBtn.onclick = () => {
                 this.updateSettings({
@@ -1831,8 +1826,8 @@
             const payload = endpointType === 'responses'
                 ? {
                     model,
-                    temperature: 0.9,
-                    max_output_tokens: 700,
+                    temperature: 2,
+                    max_output_tokens: 2333,
                     input: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
@@ -1840,8 +1835,8 @@
                 }
                 : {
                     model,
-                    temperature: 0.9,
-                    max_tokens: 700,
+                    temperature: 2,
+                    max_tokens: 2333,
                     messages: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
@@ -2126,12 +2121,7 @@
 
             closeButton.onclick = closeModal;
 
-            // 点击遮罩层关闭
-            overlay.onclick = (e) => {
-                if (e.target === overlay) {
-                    closeModal();
-                }
-            };
+            // 点击遮罩层不关闭，避免误触
 
             // ESC键关闭
             const escHandler = (e) => {
@@ -2437,18 +2427,34 @@
 
             const applyMaximizedPanelSize = (panel, maxWidth, maxHeight) => {
                 const rect = panel.getBoundingClientRect();
-                const width = Math.min(
+                const viewportWidth = Math.max(1, window.innerWidth);
+                const viewportHeight = Math.max(1, window.innerHeight);
+                const maxAllowedWidth = Math.max(1, viewportWidth - panelMargin * 2);
+                const maxAllowedHeight = Math.max(1, viewportHeight - panelMargin * 2);
+                const preferredWidth = Math.min(
                     Number(maxWidth),
-                    Math.floor(window.innerWidth * 0.66),
-                    Math.max(320, window.innerWidth - panelMargin)
+                    Math.floor(viewportWidth * 0.66),
+                    maxAllowedWidth
                 );
-                const height = Math.min(
+                const preferredHeight = Math.min(
                     Number(maxHeight),
-                    Math.floor(window.innerHeight * 0.84),
-                    Math.max(240, window.innerHeight - panelMargin)
+                    Math.floor(viewportHeight * 0.84),
+                    maxAllowedHeight
                 );
-                const left = rect.left;
-                const top = rect.top;
+                const width = clampValue(
+                    preferredWidth,
+                    Math.min(260, maxAllowedWidth),
+                    maxAllowedWidth
+                );
+                const height = clampValue(
+                    preferredHeight,
+                    Math.min(180, maxAllowedHeight),
+                    maxAllowedHeight
+                );
+                const maxLeft = Math.max(panelMargin, viewportWidth - width - panelMargin);
+                const maxTop = Math.max(panelMargin, viewportHeight - height - panelMargin);
+                const left = clampValue(rect.left, panelMargin, maxLeft);
+                const top = clampValue(rect.top, panelMargin, maxTop);
                 setPanelRect(panel, left, top, width, height);
             };
 
@@ -2495,28 +2501,18 @@
                     }
 
                     const rect = panel.getBoundingClientRect();
-                    const width = rect.width || panel.offsetWidth || 320;
-                    const height = rect.height || panel.offsetHeight || 260;
                     const offsetX = event.clientX - rect.left;
                     const offsetY = event.clientY - rect.top;
+                    const dragWidth = rect.width || panel.offsetWidth || 320;
+                    const dragHeight = rect.height || panel.offsetHeight || 260;
                     panelState.isManualPosition = true;
 
                     const getDragBounds = () => {
-                        if (!panelState.isMaximized) {
-                            const minLeft = panelMargin;
-                            const maxLeft = Math.max(minLeft, window.innerWidth - width - panelMargin);
-                            const minTop = panelMargin;
-                            const maxTop = Math.max(minTop, window.innerHeight - height - panelMargin);
-                            return { minLeft, maxLeft, minTop, maxTop };
-                        }
-
-                        // 最大化后仍允许拖动，至少保留部分面板可见，避免“看起来无法拖动”。
-                        const minVisibleWidth = Math.min(width, Math.max(160, Math.floor(width * 0.35)));
-                        const minVisibleHeight = Math.min(height, 56);
-                        const minLeft = panelMargin - (width - minVisibleWidth);
-                        const maxLeft = Math.max(minLeft, window.innerWidth - minVisibleWidth - panelMargin);
+                        // 无论普通/最大化，拖拽都按当前实际尺寸限制，始终保留边距，不允许贴边。
+                        const minLeft = panelMargin;
+                        const maxLeft = Math.max(minLeft, window.innerWidth - dragWidth - panelMargin);
                         const minTop = panelMargin;
-                        const maxTop = Math.max(minTop, window.innerHeight - minVisibleHeight - panelMargin);
+                        const maxTop = Math.max(minTop, window.innerHeight - dragHeight - panelMargin);
                         return { minLeft, maxLeft, minTop, maxTop };
                     };
 
@@ -2524,7 +2520,8 @@
                         const bounds = getDragBounds();
                         const left = clampValue(moveEvent.clientX - offsetX, bounds.minLeft, bounds.maxLeft);
                         const top = clampValue(moveEvent.clientY - offsetY, bounds.minTop, bounds.maxTop);
-                        setPanelRect(panel, left, top, width, height);
+                        // 拖拽只更新位置，避免重复写入宽高导致边框累计放大。
+                        setPanelRect(panel, left, top);
                     };
 
                     const onMouseUp = () => {
@@ -3704,6 +3701,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.2 已加载 - 新增AI反对意见与脚本菜单设置');
+    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.3 已加载 - 新增AI反对意见与脚本菜单设置');
 
 })();
