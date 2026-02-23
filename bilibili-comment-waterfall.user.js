@@ -1,12 +1,17 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
-// @namespace    http://tampermonkey.net/
-// @version      2.5.1
+// @namespace    https://violentmonkey.github.io/
+// @version      2.5.2
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
 // @match        https://www.bilibili.com/video/*
-// @grant        none
+// @grant        GM.registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
+// @connect      *
 // @license      CC-BY-NC-4.0
 // @run-at       document-end
 // ==/UserScript==
@@ -26,10 +31,75 @@
         REPLY_FETCH_CONCURRENCY: 10 // 回复抓取并发数
     };
 
+    const STORAGE_KEYS = {
+        SETTINGS: 'bili_comment_expand_settings_v1'
+    };
+
+    const DEFAULT_SETTINGS = {
+        openAIApiKey: '',
+        openAIBaseUrl: '',
+        openAIEndpointType: 'responses',
+        openAIModel: '',
+        enableAiRebuttal: false,
+        enableDebugLogs: false
+    };
+
+    function readSettingsFromScriptStorage() {
+        if (typeof GM_getValue !== 'function') {
+            return null;
+        }
+
+        const rawValue = GM_getValue(STORAGE_KEYS.SETTINGS, null);
+        if (!rawValue || typeof rawValue !== 'object') {
+            return null;
+        }
+
+        return rawValue;
+    }
+
+    function saveSettingsToScriptStorage(settings) {
+        if (typeof GM_setValue !== 'function') {
+            return false;
+        }
+
+        GM_setValue(STORAGE_KEYS.SETTINGS, settings);
+        return true;
+    }
+
     // 工具函数
     const Utils = {
+        _debugCache: {
+            enabled: false,
+            lastReadAt: 0
+        },
+
+        isDebugLogEnabled() {
+            const now = Date.now();
+            if (now - this._debugCache.lastReadAt < 1500) {
+                return this._debugCache.enabled;
+            }
+
+            this._debugCache.lastReadAt = now;
+            try {
+                const settings = readSettingsFromScriptStorage();
+                if (!settings) {
+                    this._debugCache.enabled = Boolean(DEFAULT_SETTINGS.enableDebugLogs);
+                    return this._debugCache.enabled;
+                }
+                this._debugCache.enabled = Boolean(settings.enableDebugLogs);
+                return this._debugCache.enabled;
+            } catch (error) {
+                this._debugCache.enabled = Boolean(DEFAULT_SETTINGS.enableDebugLogs);
+                return this._debugCache.enabled;
+            }
+        },
+
         // 调试日志输出功能
         log(level, message, ...args) {
+            if (level === 'info' && !this.isDebugLogEnabled()) {
+                return;
+            }
+
             const timestamp = new Date().toISOString();
             const prefix = `[Bilibili评论展开助手 ${timestamp}]`;
 
@@ -426,6 +496,52 @@
         }
     };
 
+    class ScriptSettingsStore {
+        constructor() {
+            this.settings = this.load();
+        }
+
+        load() {
+            try {
+                const storedSettings = readSettingsFromScriptStorage();
+                if (!storedSettings || typeof storedSettings !== 'object') {
+                    return { ...DEFAULT_SETTINGS };
+                }
+
+                return {
+                    ...DEFAULT_SETTINGS,
+                    ...storedSettings
+                };
+            } catch (error) {
+                Utils.log('warn', '读取脚本设置失败，已使用默认设置', error);
+                return { ...DEFAULT_SETTINGS };
+            }
+        }
+
+        save(nextSettings) {
+            this.settings = {
+                ...DEFAULT_SETTINGS,
+                ...(nextSettings && typeof nextSettings === 'object' ? nextSettings : {})
+            };
+            const saveSuccess = saveSettingsToScriptStorage(this.settings);
+            if (!saveSuccess) {
+                Utils.log('warn', '未检测到 GM_setValue，设置未持久化');
+            }
+            return this.getAll();
+        }
+
+        getAll() {
+            return { ...this.settings };
+        }
+
+        update(patch) {
+            return this.save({
+                ...this.settings,
+                ...(patch && typeof patch === 'object' ? patch : {})
+            });
+        }
+    }
+
     // B站评论API组件
     class BilibiliCommentAPI {
         constructor() {
@@ -549,39 +665,6 @@
 
             Utils.log('info', `总共获取到 ${allReplies.length} 条回复 (并发=${safeConcurrency})`);
             return allReplies;
-        }
-
-        async getCommentInfo(oid, rpid) {
-            const cacheKey = this.getCacheKey('info', oid, rpid);
-            const cached = this.cache.get(cacheKey);
-
-            if (this.isValidCache(cached)) {
-                return cached.data;
-            }
-
-            try {
-                const url = new URL(`${CONFIG.API_BASE}/x/v2/reply/info`);
-                url.searchParams.set('type', CONFIG.COMMENT_TYPE);
-                url.searchParams.set('oid', oid);
-                url.searchParams.set('rpid', rpid);
-
-                const response = await Utils.fetchWithRetry(url.toString());
-                const data = await response.json();
-
-                if (data.code !== 0) {
-                    throw new Error(`API错误: ${data.message || '未知错误'} (code: ${data.code})`);
-                }
-
-                this.cache.set(cacheKey, {
-                    data: data.data,
-                    timestamp: Date.now()
-                });
-
-                return data.data;
-
-            } catch (error) {
-                throw error;
-            }
         }
 
         clearCache() {
@@ -961,7 +1044,8 @@
         }
 
         extractVideoId() {
-            const aid = window.__INITIAL_STATE__?.aid;
+            const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            const aid = pageWindow?.__INITIAL_STATE__?.aid || window.__INITIAL_STATE__?.aid;
             if (!aid) return null;
             return aid.toString();
         }
@@ -998,6 +1082,9 @@
         constructor() {
             this.domWatcher = new DOMWatcher();
             this.commentAPI = new BilibiliCommentAPI();
+            this.settingsStore = new ScriptSettingsStore();
+            this.settings = this.settingsStore.getAll();
+            this.settingsModalElements = null;
             this.isInitialized = false;
         }
 
@@ -1009,6 +1096,7 @@
 
             try {
                 Utils.log('info', '开始初始化Bilibili评论展开助手脚本');
+                this.registerSettingsMenuCommand();
                 this.setupEventHandlers();
                 this.domWatcher.observeCommentSection();
 
@@ -1019,6 +1107,650 @@
                 Utils.log('error', '脚本初始化失败', error);
                 throw error;
             }
+        }
+
+        registerSettingsMenuCommand() {
+            let registerMenu = null;
+            if (typeof GM !== 'undefined' && typeof GM.registerMenuCommand === 'function') {
+                registerMenu = GM.registerMenuCommand.bind(GM);
+            }
+            if (!registerMenu) {
+                Utils.log('warn', '未检测到 GM.registerMenuCommand，无法注册脚本菜单按钮');
+                return;
+            }
+
+            try {
+                registerMenu('⚙️ 评论展开助手设置', () => {
+                    this.openSettingsModal();
+                });
+
+                const debugMenuText = this.settings.enableDebugLogs ? '🪵 关闭调试日志' : '🪵 开启调试日志';
+                registerMenu(debugMenuText, () => {
+                    const nextState = !Boolean(this.settings.enableDebugLogs);
+                    this.updateSettings({ enableDebugLogs: nextState });
+                    console.warn(`[Bilibili评论展开助手] 调试日志已${nextState ? '开启' : '关闭'}，刷新页面后菜单文案会同步更新`);
+                });
+            } catch (error) {
+                Utils.log('warn', '注册脚本菜单按钮失败', error);
+            }
+        }
+
+        getSettings() {
+            return { ...this.settings };
+        }
+
+        updateSettings(patch) {
+            this.settings = this.settingsStore.update(patch);
+            Utils._debugCache.lastReadAt = 0;
+            Utils._debugCache.enabled = Boolean(this.settings.enableDebugLogs);
+            this.dispatchSettingsChanged();
+            return this.getSettings();
+        }
+
+        dispatchSettingsChanged() {
+            window.dispatchEvent(new CustomEvent('bili-comment-expand-settings-changed', {
+                detail: this.getSettings()
+            }));
+        }
+
+        openSettingsModal() {
+            if (this.settingsModalElements?.overlay && document.body.contains(this.settingsModalElements.overlay)) {
+                this.settingsModalElements.overlay.style.display = 'flex';
+                return;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.style.cssText = `
+                position: fixed;
+                inset: 0;
+                background: rgba(0, 0, 0, 0.65);
+                z-index: 10006;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+            `;
+
+            const modal = document.createElement('div');
+            modal.style.cssText = `
+                width: min(560px, calc(100vw - 24px));
+                border: 1px solid #3a3a3a;
+                border-radius: 10px;
+                background: #1f1f1f;
+                color: #e1e2e3;
+                box-shadow: 0 14px 32px rgba(0, 0, 0, 0.5);
+                overflow: hidden;
+            `;
+
+            const header = document.createElement('div');
+            header.style.cssText = `
+                padding: 14px 16px;
+                border-bottom: 1px solid #333;
+                font-size: 14px;
+                font-weight: 600;
+            `;
+            header.textContent = 'OpenAI 参数设置';
+
+            const body = document.createElement('div');
+            body.style.cssText = `
+                padding: 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            `;
+
+            const createField = (labelText, placeholder, value, isPassword = false) => {
+                const wrapper = document.createElement('label');
+                wrapper.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+                const label = document.createElement('span');
+                label.style.cssText = 'font-size: 12px; color: #c9ccd1;';
+                label.textContent = labelText;
+
+                const input = document.createElement('input');
+                input.type = isPassword ? 'password' : 'text';
+                input.placeholder = placeholder;
+                input.value = value;
+                input.style.cssText = `
+                    border: 1px solid #444;
+                    background: #262626;
+                    color: #e1e2e3;
+                    border-radius: 6px;
+                    padding: 8px 10px;
+                    font-size: 13px;
+                    outline: none;
+                `;
+                input.onfocus = () => {
+                    input.style.borderColor = '#00a1d6';
+                };
+                input.onblur = () => {
+                    input.style.borderColor = '#444';
+                };
+
+                wrapper.appendChild(label);
+                wrapper.appendChild(input);
+                return { wrapper, input };
+            };
+
+            const endpointConfig = this.buildOpenAIEndpointConfig(
+                this.settings.openAIBaseUrl || '',
+                this.settings.openAIEndpointType || ''
+            );
+
+            const apiKeyField = createField(
+                'OPENAI API Key',
+                'sk-***',
+                this.settings.openAIApiKey || '',
+                true
+            );
+            const apiUrlField = createField(
+                '请求基础地址',
+                'https://api.openai.com/v1',
+                endpointConfig.baseUrl || ''
+            );
+            const endpointTypeWrapper = document.createElement('label');
+            endpointTypeWrapper.style.cssText = 'display: flex; flex-direction: column; gap: 6px;';
+            const endpointTypeLabel = document.createElement('span');
+            endpointTypeLabel.style.cssText = 'font-size: 12px; color: #c9ccd1;';
+            endpointTypeLabel.textContent = '接口类型';
+            const endpointTypeSelect = document.createElement('select');
+            endpointTypeSelect.style.cssText = `
+                border: 1px solid #444;
+                background: #262626;
+                color: #e1e2e3;
+                border-radius: 6px;
+                padding: 8px 10px;
+                font-size: 13px;
+                outline: none;
+            `;
+            endpointTypeSelect.innerHTML = `
+                <option value="responses">responses</option>
+                <option value="chat_completions">chat/completions</option>
+            `;
+            endpointTypeSelect.value = endpointConfig.endpointType;
+            endpointTypeSelect.onfocus = () => {
+                endpointTypeSelect.style.borderColor = '#00a1d6';
+            };
+            endpointTypeSelect.onblur = () => {
+                endpointTypeSelect.style.borderColor = '#444';
+            };
+            endpointTypeWrapper.appendChild(endpointTypeLabel);
+            endpointTypeWrapper.appendChild(endpointTypeSelect);
+
+            const modelField = createField(
+                '模型名称',
+                'gpt-4o-mini',
+                this.settings.openAIModel || ''
+            );
+
+            const aiToggleRow = document.createElement('label');
+            aiToggleRow.style.cssText = `
+                border: 1px solid #3a3a3a;
+                border-radius: 8px;
+                background: #262626;
+                padding: 10px;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                cursor: pointer;
+            `;
+
+            const aiToggleText = document.createElement('div');
+            aiToggleText.style.cssText = 'display: flex; flex-direction: column; gap: 4px;';
+            aiToggleText.innerHTML = `
+                <span style="font-size:12px; color:#e1e2e3; font-weight:600;">开启一键生成反对意见</span>
+                <span style="font-size:12px; color:#9499a0;">开启后每条回复下会显示 AI 按钮</span>
+            `;
+
+            const aiToggleInput = document.createElement('input');
+            aiToggleInput.type = 'checkbox';
+            aiToggleInput.checked = Boolean(this.settings.enableAiRebuttal);
+            aiToggleInput.style.cssText = `
+                width: 18px;
+                height: 18px;
+                accent-color: #00a1d6;
+                cursor: pointer;
+                flex-shrink: 0;
+            `;
+
+            aiToggleRow.appendChild(aiToggleText);
+            aiToggleRow.appendChild(aiToggleInput);
+
+            const tips = document.createElement('div');
+            tips.style.cssText = 'font-size: 12px; color: #7f858c; line-height: 1.5;';
+            tips.textContent = '设置会保存在 Violentmonkey 脚本存储。请求基础地址请填写到 /v1；接口类型在下拉框选择。调试日志开关在脚本菜单中与设置并列。';
+
+            const footer = document.createElement('div');
+            footer.style.cssText = `
+                padding: 12px 16px 16px;
+                display: flex;
+                justify-content: flex-end;
+                gap: 8px;
+            `;
+
+            const cancelBtn = document.createElement('button');
+            cancelBtn.type = 'button';
+            cancelBtn.style.cssText = `
+                border: 1px solid #4a4a4a;
+                background: #2d2d2d;
+                color: #c9ccd1;
+                border-radius: 6px;
+                font-size: 12px;
+                padding: 6px 12px;
+                cursor: pointer;
+            `;
+            cancelBtn.textContent = '取消';
+
+            const saveBtn = document.createElement('button');
+            saveBtn.type = 'button';
+            saveBtn.style.cssText = `
+                border: 1px solid #00a1d6;
+                background: #00a1d6;
+                color: #ffffff;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 6px 12px;
+                cursor: pointer;
+            `;
+            saveBtn.textContent = '保存';
+
+            const closeModal = () => {
+                if (overlay.parentNode) {
+                    overlay.remove();
+                }
+            };
+
+            overlay.onclick = (e) => {
+                if (e.target === overlay) {
+                    closeModal();
+                }
+            };
+            cancelBtn.onclick = closeModal;
+            saveBtn.onclick = () => {
+                this.updateSettings({
+                    openAIApiKey: apiKeyField.input.value.trim(),
+                    openAIBaseUrl: apiUrlField.input.value.trim(),
+                    openAIEndpointType: endpointTypeSelect.value,
+                    openAIModel: modelField.input.value.trim(),
+                    enableAiRebuttal: aiToggleInput.checked
+                });
+                closeModal();
+            };
+
+            body.appendChild(apiKeyField.wrapper);
+            body.appendChild(apiUrlField.wrapper);
+            body.appendChild(endpointTypeWrapper);
+            body.appendChild(modelField.wrapper);
+            body.appendChild(aiToggleRow);
+            body.appendChild(tips);
+            footer.appendChild(cancelBtn);
+            footer.appendChild(saveBtn);
+
+            modal.appendChild(header);
+            modal.appendChild(body);
+            modal.appendChild(footer);
+            overlay.appendChild(modal);
+
+            this.settingsModalElements = { overlay };
+            document.body.appendChild(overlay);
+        }
+
+        normalizeOpenAIEndpointType(endpointType) {
+            return endpointType === 'chat_completions' ? 'chat_completions' : 'responses';
+        }
+
+        normalizeOpenAIBaseUrl(rawUrl) {
+            const input = (rawUrl || '').trim();
+            if (!input) {
+                return '';
+            }
+
+            const normalized = input.replace(/\/+$/, '');
+            if (/\/v1$/i.test(normalized)) {
+                return normalized;
+            }
+
+            if (/^https?:\/\/.+$/i.test(normalized)) {
+                return `${normalized}/v1`;
+            }
+
+            return normalized;
+        }
+
+        buildOpenAIEndpointConfig(rawBaseUrl, rawEndpointType) {
+            const input = (rawBaseUrl || '').trim().replace(/\/+$/, '');
+            if (/\/chat\/completions(?:\?|$)/i.test(input) || /\/responses(?:\?|$)/i.test(input)) {
+                return {
+                    baseUrl: '',
+                    endpointType: this.normalizeOpenAIEndpointType(rawEndpointType),
+                    endpointUrl: '',
+                    error: '请求基础地址不应包含 /chat/completions 或 /responses，请填写到 /v1 即可'
+                };
+            }
+
+            const baseUrl = this.normalizeOpenAIBaseUrl(rawBaseUrl);
+            const endpointType = this.normalizeOpenAIEndpointType(rawEndpointType);
+
+            if (!baseUrl) {
+                return {
+                    baseUrl: '',
+                    endpointType,
+                    endpointUrl: '',
+                    error: ''
+                };
+            }
+
+            const endpointPath = endpointType === 'chat_completions' ? 'chat/completions' : 'responses';
+            return {
+                baseUrl,
+                endpointType,
+                endpointUrl: `${baseUrl}/${endpointPath}`,
+                error: ''
+            };
+        }
+
+        getReplyFloorValue(reply, replyFloorMap) {
+            const floorInfo = replyFloorMap.get(reply) || replyFloorMap.get(this.getReplyId(reply));
+            const floor = Number(floorInfo?.value);
+            if (!Number.isFinite(floor) || floor <= 0) {
+                throw new Error(`楼层映射缺失: rpid=${this.getReplyId(reply) || '-'}`);
+            }
+            return Math.floor(floor);
+        }
+
+        getReplyDisplayFloor(reply, replyFloorMap) {
+            return `${this.getReplyFloorValue(reply, replyFloorMap)}楼`;
+        }
+
+        buildAiAnalysisContext(replies, replyFloorMap, rootComment) {
+            const sortedReplies = [...replies].sort((a, b) => {
+                const floorA = this.getReplyFloorValue(a, replyFloorMap);
+                const floorB = this.getReplyFloorValue(b, replyFloorMap);
+                if (floorA !== floorB) {
+                    return floorA - floorB;
+                }
+
+                const timeA = Number(a?.ctime || 0);
+                const timeB = Number(b?.ctime || 0);
+                return timeA - timeB;
+            });
+
+            const lines = [];
+            if (rootComment) {
+                const rootMessage = String(rootComment.content?.message || '').trim();
+                lines.push(`[楼主原评] 用户:${rootComment.member?.uname || '楼主'} 内容:${rootMessage}`);
+            }
+
+            sortedReplies.forEach((reply) => {
+                const floorLabel = this.getReplyDisplayFloor(reply, replyFloorMap);
+                const username = reply.member?.uname || '匿名用户';
+                const message = String(reply.content?.message || '').replace(/\s+/g, ' ').trim();
+                const parentId = this.getParentReplyId(reply);
+                lines.push(`[${floorLabel}] rpid:${this.getReplyId(reply)} parent:${parentId || '-'} 用户:${username} 内容:${message}`);
+            });
+
+            return {
+                sortedReplies,
+                contextText: lines.join('\n')
+            };
+        }
+
+        buildAiPrompt(targetReply, replies, replyFloorMap, rootComment) {
+            const { contextText } = this.buildAiAnalysisContext(replies, replyFloorMap, rootComment);
+            const targetFloor = this.getReplyDisplayFloor(targetReply, replyFloorMap);
+            const targetAuthor = targetReply.member?.uname || '匿名用户';
+            const targetMessage = String(targetReply.content?.message || '').replace(/\s+/g, ' ').trim();
+
+            const systemPrompt = [
+                '你是一个理性、克制的中文辩论助手。',
+                '目标：只针对指定目标楼层生成一段反对意见。',
+                '其他楼层只能用于理解上下文，不要逐条反驳其他人。',
+                '要求：',
+                '1) 直接输出可发布的中文回复，不要输出分析过程。',
+                '2) 先简短承认对方一个合理点，再提出核心反驳。',
+                '3) 不要人身攻击，不要辱骂，不要极端词。',
+                '4) 长度控制在80-180字。'
+            ].join('\n');
+
+            const userPrompt = [
+                '以下是完整楼层上下文（含楼主与全部回复），供你理解前因后果：',
+                contextText || '无',
+                '',
+                '请仅针对下面这个目标楼层发言生成反对意见：',
+                `目标楼层: ${targetFloor}`,
+                `目标作者: ${targetAuthor}`,
+                `目标内容: ${targetMessage}`
+            ].join('\n');
+
+            return {
+                systemPrompt,
+                userPrompt
+            };
+        }
+
+        extractAITextFromResponse(data) {
+            if (!data || typeof data !== 'object') {
+                return '';
+            }
+
+            const messageContent = data?.choices?.[0]?.message?.content;
+            if (typeof messageContent === 'string' && messageContent.trim()) {
+                return messageContent.trim();
+            }
+            if (Array.isArray(messageContent)) {
+                const combined = messageContent
+                    .map(item => (typeof item === 'string' ? item : item?.text || ''))
+                    .join('')
+                    .trim();
+                if (combined) {
+                    return combined;
+                }
+            }
+
+            if (typeof data.output_text === 'string' && data.output_text.trim()) {
+                return data.output_text.trim();
+            }
+
+            if (Array.isArray(data.output)) {
+                const combined = data.output
+                    .flatMap(item => item?.content || [])
+                    .map(content => content?.text || '')
+                    .join('')
+                    .trim();
+                if (combined) {
+                    return combined;
+                }
+            }
+
+            return '';
+        }
+
+        getGMRequestMethod() {
+            if (typeof GM_xmlhttpRequest === 'function') {
+                return GM_xmlhttpRequest;
+            }
+            return null;
+        }
+
+        safeJSONParse(rawText) {
+            if (typeof rawText !== 'string' || !rawText.trim()) {
+                return null;
+            }
+
+            try {
+                return JSON.parse(rawText);
+            } catch (error) {
+                return null;
+            }
+        }
+
+        formatAIRequestMeta(meta = {}) {
+            const endpointType = meta.endpointType || '-';
+            const model = meta.model || '-';
+            const promptChars = Number(meta.promptChars || 0);
+            const safePromptChars = Number.isFinite(promptChars) && promptChars > 0 ? String(promptChars) : '-';
+            const url = (meta.url || '').trim() || '-';
+            return `请求信息: endpoint=${endpointType}, model=${model}, promptChars=${safePromptChars}, url=${url}`;
+        }
+
+        buildAIHttpError(status, statusText, responseText, requestMeta = {}) {
+            const header = `AI请求失败: HTTP ${status}${statusText ? ` ${statusText}` : ''}`;
+            const parsedBody = this.safeJSONParse(responseText);
+            const errorObj = (parsedBody && typeof parsedBody === 'object' && parsedBody.error && typeof parsedBody.error === 'object')
+                ? parsedBody.error
+                : null;
+
+            const errorType = typeof errorObj?.type === 'string' ? errorObj.type.trim() : '';
+            const errorCode = typeof errorObj?.code === 'string' ? errorObj.code.trim() : '';
+            const errorMessage = typeof errorObj?.message === 'string' ? errorObj.message.trim() : '';
+
+            const lines = [header, this.formatAIRequestMeta(requestMeta)];
+
+            if (errorType || errorCode || errorMessage) {
+                const detailParts = [];
+                if (errorType) detailParts.push(`type=${errorType}`);
+                if (errorCode) detailParts.push(`code=${errorCode}`);
+                if (errorMessage) detailParts.push(`message=${errorMessage}`);
+                lines.push(`服务返回: ${detailParts.join(', ')}`);
+            } else if (responseText && responseText.trim()) {
+                lines.push(`服务返回片段: ${responseText.slice(0, 280)}`);
+            }
+
+            if (errorType === 'upstream_error') {
+                lines.push('说明: 上游服务异常，常见原因是网关后端故障、模型暂不可用、接口类型与网关实现不匹配。');
+                lines.push('建议: 切换 responses/chat_completions、换模型、减小上下文后重试。');
+            }
+
+            if (responseText && responseText.trim() && !errorMessage) {
+                lines.push(`原始返回: ${responseText.slice(0, 360)}`);
+            }
+
+            return new Error(lines.join('\n'));
+        }
+
+        requestJSONWithGM(url, payload, headers = {}, requestMeta = {}) {
+            const gmRequest = this.getGMRequestMethod();
+            if (!gmRequest) {
+                return Promise.reject(new Error('未检测到 GM_xmlhttpRequest'));
+            }
+
+            return new Promise((resolve, reject) => {
+                gmRequest({
+                    method: 'POST',
+                    url,
+                    headers,
+                    data: JSON.stringify(payload),
+                    timeout: Math.max(CONFIG.REQUEST_TIMEOUT * 3, 30000),
+                    onload: (response) => {
+                        const status = Number(response?.status || 0);
+                        const responseText = typeof response?.responseText === 'string' ? response.responseText : '';
+                        const statusText = String(response?.statusText || '').trim();
+
+                        if (status < 200 || status >= 300) {
+                            reject(this.buildAIHttpError(status, statusText, responseText, {
+                                ...requestMeta,
+                                url
+                            }));
+                            return;
+                        }
+
+                        try {
+                            const jsonData = JSON.parse(responseText || '{}');
+                            resolve(jsonData);
+                        } catch (error) {
+                            reject(new Error(`AI返回非JSON内容: ${responseText.slice(0, 220)}`));
+                        }
+                    },
+                    onerror: (error) => {
+                        reject(new Error([
+                            `AI请求失败: 网络错误 (${String(error?.error || 'ERR_FAILED')})`,
+                            this.formatAIRequestMeta({
+                                ...requestMeta,
+                                url
+                            })
+                        ].join('\n')));
+                    },
+                    ontimeout: () => {
+                        reject(new Error([
+                            'AI请求超时，请稍后重试',
+                            this.formatAIRequestMeta({
+                                ...requestMeta,
+                                url
+                            })
+                        ].join('\n')));
+                    }
+                });
+            });
+        }
+
+        async generateAIRebuttal(targetReply, replies, replyFloorMap, rootComment) {
+            const settings = this.getSettings();
+            const apiKey = (settings.openAIApiKey || '').trim();
+            const endpointConfig = this.buildOpenAIEndpointConfig(settings.openAIBaseUrl || '', settings.openAIEndpointType || '');
+            const apiUrl = endpointConfig.endpointUrl;
+            const model = (settings.openAIModel || '').trim();
+
+            if (!apiKey) {
+                throw new Error('请先在脚本设置中填写 OPENAI API Key');
+            }
+            if (endpointConfig.error) {
+                throw new Error(endpointConfig.error);
+            }
+            if (!apiUrl) {
+                throw new Error('请先在脚本设置中填写请求基础地址');
+            }
+            if (!/^https?:\/\//i.test(apiUrl)) {
+                throw new Error('请求地址格式不正确，请填写完整的 http(s) 地址');
+            }
+            if (!model) {
+                throw new Error('请先在脚本设置中填写模型名称');
+            }
+
+            const { systemPrompt, userPrompt } = this.buildAiPrompt(targetReply, replies, replyFloorMap, rootComment);
+            const endpointType = endpointConfig.endpointType;
+            const payload = endpointType === 'responses'
+                ? {
+                    model,
+                    temperature: 0.7,
+                    input: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ]
+                }
+                : {
+                    model,
+                    temperature: 0.7,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ]
+                };
+
+            const requestHeaders = {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            };
+
+            console.info('[Bilibili评论展开助手] AI请求内容', {
+                url: apiUrl,
+                endpointType,
+                model,
+                payload
+            });
+
+            const data = await this.requestJSONWithGM(apiUrl, payload, requestHeaders, {
+                endpointType,
+                model,
+                promptChars: systemPrompt.length + userPrompt.length
+            });
+
+            const aiText = this.extractAITextFromResponse(data);
+            if (!aiText) {
+                throw new Error('AI返回内容为空，请检查模型和请求地址是否兼容 chat/completions 或 responses');
+            }
+
+            return aiText;
         }
 
         setupEventHandlers() {
@@ -1040,13 +1772,31 @@
                 }
 
                 Utils.log('info', `开始获取回复数据: oid=${commentInfo.oid}, rootId=${commentInfo.rootId}`);
+                const rootThreadData = commentInfo?.commentElement?.__data || null;
+                const rootMessage = typeof rootThreadData?.content?.message === 'string'
+                    ? rootThreadData.content.message
+                    : '';
+                const rootComment = {
+                    rpid: String(commentInfo.rootId),
+                    member: {
+                        uname: rootThreadData?.member?.uname || '楼主',
+                        mid: rootThreadData?.member?.mid || rootThreadData?.mid || '',
+                        avatar: rootThreadData?.member?.avatar || '',
+                        vip: rootThreadData?.member?.vip || null
+                    },
+                    ctime: Number(rootThreadData?.ctime || 0) || 0,
+                    content: {
+                        message: rootMessage
+                    }
+                };
+
                 const realReplies = await this.commentAPI.getAllReplies(commentInfo.oid, commentInfo.rootId);
                 const replyCount = realReplies.length;
                 Utils.log('info', `成功获取 ${realReplies.length} 条真实回复数据`);
 
                 // 创建评论展开弹出框，传入真实数据
                 Utils.log('info', `创建弹出框: replyCount=${replyCount}, realReplies.length=${realReplies.length}`);
-                this.createExpandModal(replyCount, realReplies);
+                this.createExpandModal(replyCount, realReplies, rootComment);
 
                 // 隐藏加载提示
                 this.hideLoadingIndicator();
@@ -1083,7 +1833,7 @@
             }
         }
 
-        createExpandModal(replyCount, realReplies = []) {
+        createExpandModal(replyCount, realReplies = [], rootComment = null) {
             const docStyle = document.documentElement.style;
             const bodyStyle = document.body.style;
             const previousDocStyle = {
@@ -1205,7 +1955,14 @@
                 text-align: left;
             `;
 
-            const repliesViewController = this.renderRepliesContent(body, realReplies, replyCount, modal, overlay);
+            const repliesViewController = this.renderRepliesContent(
+                body,
+                realReplies,
+                replyCount,
+                modal,
+                overlay,
+                rootComment
+            );
 
             modal.appendChild(header);
             modal.appendChild(body);
@@ -1265,7 +2022,7 @@
             document.body.appendChild(overlay);
         }
 
-        renderRepliesContent(container, replies, totalCount, modalElement = null, overlayElement = null) {
+        renderRepliesContent(container, replies, totalCount, modalElement = null, overlayElement = null, rootComment = null) {
             const replyFloorMap = this.buildReplyFloorMap(replies);
             const replyIndex = this.buildReplyIndex(replies);
 
@@ -1382,13 +2139,94 @@
             conversationPanel.appendChild(conversationHeader);
             conversationPanel.appendChild(conversationBody);
 
+            // AI反对意见侧边浮层（样式参考对话链窗口）
+            const aiPanel = document.createElement('div');
+            aiPanel.style.cssText = `
+                position: fixed;
+                width: 360px;
+                max-width: min(92vw, 390px);
+                min-width: 280px;
+                border: 1px solid #3a3a3a;
+                background: #171717;
+                display: none;
+                flex-direction: column;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
+                z-index: 10003;
+            `;
+
+            const aiHeader = document.createElement('div');
+            aiHeader.style.cssText = `
+                padding: 12px 14px;
+                border-bottom: 1px solid #3a3a3a;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            `;
+
+            const aiTitle = document.createElement('span');
+            aiTitle.style.cssText = `
+                color: #e1e2e3;
+                font-size: 13px;
+                font-weight: 600;
+            `;
+            aiTitle.textContent = 'AI反对意见';
+
+            const aiCloseBtn = document.createElement('button');
+            aiCloseBtn.type = 'button';
+            aiCloseBtn.style.cssText = `
+                border: 1px solid #4a4a4a;
+                background: #2a2a2a;
+                color: #9499a0;
+                border-radius: 4px;
+                font-size: 12px;
+                padding: 2px 8px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+            `;
+            aiCloseBtn.textContent = '关闭';
+            aiCloseBtn.onmouseover = () => {
+                aiCloseBtn.style.borderColor = '#00a1d6';
+                aiCloseBtn.style.color = '#00a1d6';
+            };
+            aiCloseBtn.onmouseout = () => {
+                aiCloseBtn.style.borderColor = '#4a4a4a';
+                aiCloseBtn.style.color = '#9499a0';
+            };
+
+            const aiBody = document.createElement('div');
+            aiBody.style.cssText = `
+                flex: 1;
+                min-height: 0;
+                overflow-y: auto;
+                padding: 12px;
+                background: #171717;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            `;
+
+            aiHeader.appendChild(aiTitle);
+            aiHeader.appendChild(aiCloseBtn);
+            aiPanel.appendChild(aiHeader);
+            aiPanel.appendChild(aiBody);
+
             const panelHost = overlayElement || document.body;
             panelHost.appendChild(conversationPanel);
+            panelHost.appendChild(aiPanel);
 
-            // 初始化排序状态
+            // 初始化排序与面板状态
             let currentSort = 'hot';
             let timeOrder = 'desc'; // 'desc' 为倒序（最新在前），'asc' 为正序（最旧在前）
             let activeConversationReplyId = '';
+            let aiRebuttalEnabled = Boolean(this.settings.enableAiRebuttal);
+            let activeAIReplyId = '';
+            let aiLoadingReplyId = '';
+            let aiTargetReply = null;
+            let aiResultText = '';
+            let aiErrorText = '';
             const panelGap = 12;
             const panelMargin = 12;
 
@@ -1422,9 +2260,121 @@
                 conversationPanel.style.right = '';
             };
 
+            const positionAiPanel = () => {
+                if (!modalElement) {
+                    aiPanel.style.right = `${panelMargin}px`;
+                    aiPanel.style.top = `${Math.max(80, Math.floor(window.innerHeight * 0.24))}px`;
+                    aiPanel.style.height = `${Math.max(220, Math.floor(window.innerHeight * 0.56))}px`;
+                    return;
+                }
+
+                const modalRect = modalElement.getBoundingClientRect();
+                const panelWidth = Math.min(390, Math.max(280, aiPanel.offsetWidth || 360));
+                let left = modalRect.right + panelGap;
+
+                if (left + panelWidth + panelMargin > window.innerWidth) {
+                    left = modalRect.left - panelGap - panelWidth;
+                }
+                if (left < panelMargin) {
+                    left = Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin);
+                }
+
+                const preferredHeight = Math.max(220, Math.min(Math.floor(window.innerHeight * 0.6), 520));
+                const topBase = modalRect.top + Math.max(80, Math.floor(modalRect.height * 0.3));
+                const maxTop = window.innerHeight - preferredHeight - panelMargin;
+                const top = Math.max(panelMargin, Math.min(topBase, maxTop));
+
+                aiPanel.style.left = `${Math.round(left)}px`;
+                aiPanel.style.top = `${Math.round(top)}px`;
+                aiPanel.style.height = `${Math.round(preferredHeight)}px`;
+                aiPanel.style.right = '';
+            };
+
+            const renderAIPanel = () => {
+                aiBody.innerHTML = '';
+
+                if (!aiTargetReply) {
+                    const emptyText = document.createElement('div');
+                    emptyText.style.cssText = 'color:#9499a0;font-size:13px;line-height:1.6;';
+                    emptyText.textContent = '点击回复下方的“生成反对意见”按钮后，这里会显示 AI 结果。';
+                    aiBody.appendChild(emptyText);
+                    return;
+                }
+
+                const targetCard = document.createElement('div');
+                targetCard.style.cssText = `
+                    border: 1px solid #333;
+                    background: #202020;
+                    border-radius: 8px;
+                    padding: 10px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 6px;
+                `;
+
+                const floorLabel = this.getReplyDisplayFloor(aiTargetReply, replyFloorMap);
+                const targetHeader = document.createElement('div');
+                targetHeader.style.cssText = 'font-size:12px;color:#8ea2b0;';
+                targetHeader.textContent = `目标楼层: ${floorLabel} | 作者: ${aiTargetReply.member?.uname || '匿名用户'}`;
+
+                const targetMessage = document.createElement('div');
+                targetMessage.style.cssText = 'font-size:13px;color:#d0d2d6;line-height:1.6;white-space:pre-wrap;word-break:break-word;';
+                targetMessage.textContent = aiTargetReply.content?.message || '';
+
+                targetCard.appendChild(targetHeader);
+                targetCard.appendChild(targetMessage);
+                aiBody.appendChild(targetCard);
+
+                if (aiLoadingReplyId) {
+                    const loadingText = document.createElement('div');
+                    loadingText.style.cssText = 'font-size:13px;color:#40a9ff;line-height:1.6;';
+                    loadingText.textContent = 'AI 正在基于全部楼层分析并生成反对意见...';
+                    aiBody.appendChild(loadingText);
+                    return;
+                }
+
+                if (aiErrorText) {
+                    const errorText = document.createElement('div');
+                    errorText.style.cssText = `
+                        border: 1px solid rgba(255, 100, 100, 0.45);
+                        background: rgba(255, 80, 80, 0.08);
+                        color: #ff9a9a;
+                        border-radius: 8px;
+                        padding: 10px;
+                        font-size: 13px;
+                        line-height: 1.6;
+                        white-space: pre-wrap;
+                        word-break: break-word;
+                    `;
+                    errorText.textContent = aiErrorText;
+                    aiBody.appendChild(errorText);
+                    return;
+                }
+
+                if (aiResultText) {
+                    const resultCard = document.createElement('div');
+                    resultCard.style.cssText = `
+                        border: 1px solid rgba(0, 161, 214, 0.4);
+                        background: rgba(0, 161, 214, 0.08);
+                        color: #e6f5ff;
+                        border-radius: 8px;
+                        padding: 10px;
+                        font-size: 14px;
+                        line-height: 1.65;
+                        white-space: pre-wrap;
+                        word-break: break-word;
+                    `;
+                    resultCard.textContent = aiResultText;
+                    aiBody.appendChild(resultCard);
+                }
+            };
+
             const onViewportChange = () => {
                 if (conversationPanel.style.display !== 'none') {
                     positionConversationPanel();
+                }
+                if (aiPanel.style.display !== 'none') {
+                    positionAiPanel();
                 }
             };
             window.addEventListener('resize', onViewportChange);
@@ -1437,7 +2387,10 @@
                     timeOrder,
                     replyFloorMap,
                     handleViewConversation,
-                    activeConversationReplyId
+                    activeConversationReplyId,
+                    aiRebuttalEnabled ? handleGenerateAiRebuttal : null,
+                    activeAIReplyId,
+                    aiLoadingReplyId
                 );
             };
 
@@ -1446,6 +2399,18 @@
                 conversationPanel.style.display = 'none';
                 conversationTitle.textContent = '回复对话';
                 conversationBody.innerHTML = '';
+                renderReplies();
+            };
+
+            const hideAIPanel = () => {
+                activeAIReplyId = '';
+                aiLoadingReplyId = '';
+                aiTargetReply = null;
+                aiResultText = '';
+                aiErrorText = '';
+                aiPanel.style.display = 'none';
+                aiTitle.textContent = 'AI反对意见';
+                aiBody.innerHTML = '';
                 renderReplies();
             };
 
@@ -1472,7 +2437,58 @@
                 renderReplies();
             };
 
+            const handleGenerateAiRebuttal = async (reply) => {
+                const selectedReplyId = this.getReplyId(reply);
+                if (!selectedReplyId || aiLoadingReplyId) {
+                    return;
+                }
+
+                activeAIReplyId = selectedReplyId;
+                aiLoadingReplyId = selectedReplyId;
+                aiTargetReply = reply;
+                aiErrorText = '';
+                aiResultText = '';
+                aiTitle.textContent = 'AI反对意见（分析中）';
+                aiPanel.style.display = 'flex';
+                renderAIPanel();
+                positionAiPanel();
+                renderReplies();
+
+                try {
+                    const aiText = await this.generateAIRebuttal(reply, replies, replyFloorMap, rootComment);
+                    aiResultText = aiText;
+                    aiErrorText = '';
+                    aiTitle.textContent = 'AI反对意见';
+                } catch (error) {
+                    aiErrorText = error?.message || '生成反对意见失败';
+                    aiResultText = '';
+                    aiTitle.textContent = 'AI反对意见（失败）';
+                    Utils.log('error', '生成AI反对意见失败', error);
+                } finally {
+                    aiLoadingReplyId = '';
+                    aiPanel.style.display = 'flex';
+                    renderAIPanel();
+                    positionAiPanel();
+                    renderReplies();
+                }
+            };
+
+            const onSettingsChanged = (event) => {
+                const nextEnabled = Boolean(event?.detail?.enableAiRebuttal);
+                if (nextEnabled === aiRebuttalEnabled) {
+                    return;
+                }
+                aiRebuttalEnabled = nextEnabled;
+                if (!aiRebuttalEnabled) {
+                    hideAIPanel();
+                } else {
+                    renderReplies();
+                }
+            };
+            window.addEventListener('bili-comment-expand-settings-changed', onSettingsChanged);
+
             conversationCloseBtn.onclick = hideConversationPanel;
+            aiCloseBtn.onclick = hideAIPanel;
 
             // 渲染回复列表
             renderReplies();
@@ -1507,8 +2523,12 @@
             return {
                 destroy: () => {
                     window.removeEventListener('resize', onViewportChange);
+                    window.removeEventListener('bili-comment-expand-settings-changed', onSettingsChanged);
                     if (conversationPanel.parentNode) {
                         conversationPanel.remove();
+                    }
+                    if (aiPanel.parentNode) {
+                        aiPanel.remove();
                     }
                 }
             };
@@ -1568,12 +2588,29 @@
 
         buildReplyFloorMap(replies) {
             const floorMap = new Map();
+            if (!Array.isArray(replies) || replies.length === 0) {
+                return floorMap;
+            }
 
-            // 优先使用接口直接返回的楼层字段
-            replies.forEach(reply => {
-                const apiFloor = Number(reply?.floor ?? reply?.reply_control?.floor);
-                if (Number.isFinite(apiFloor) && apiFloor > 0) {
-                    floorMap.set(reply, { value: Math.floor(apiFloor), source: 'api' });
+            // 单一楼层方案：按时间顺序分配楼层
+            const repliesByTime = [...replies].sort((a, b) => {
+                const timeA = Number(a?.ctime || 0);
+                const timeB = Number(b?.ctime || 0);
+                if (timeA !== timeB) {
+                    return timeA - timeB;
+                }
+
+                const replyIdA = this.getReplyId(a);
+                const replyIdB = this.getReplyId(b);
+                return replyIdA.localeCompare(replyIdB);
+            });
+
+            repliesByTime.forEach((reply, index) => {
+                const floorInfo = { value: index + 1, source: 'time_order' };
+                floorMap.set(reply, floorInfo);
+                const replyId = this.getReplyId(reply);
+                if (replyId) {
+                    floorMap.set(replyId, floorInfo);
                 }
             });
 
@@ -1795,7 +2832,10 @@
             timeOrder = 'desc',
             replyFloorMap = new Map(),
             onViewConversation = null,
-            activeConversationReplyId = ''
+            activeConversationReplyId = '',
+            onGenerateAiRebuttal = null,
+            activeAIReplyId = '',
+            aiLoadingReplyId = ''
         ) {
             // 排序回复
             const sortedReplies = [...replies].sort((a, b) => {
@@ -1819,13 +2859,24 @@
                     reply,
                     floorInfo,
                     onViewConversation,
-                    activeConversationReplyId
+                    activeConversationReplyId,
+                    onGenerateAiRebuttal,
+                    activeAIReplyId,
+                    aiLoadingReplyId
                 );
                 container.appendChild(replyElement);
             });
         }
 
-        createReplyElement(reply, floorInfo = null, onViewConversation = null, activeConversationReplyId = '') {
+        createReplyElement(
+            reply,
+            floorInfo = null,
+            onViewConversation = null,
+            activeConversationReplyId = '',
+            onGenerateAiRebuttal = null,
+            activeAIReplyId = '',
+            aiLoadingReplyId = ''
+        ) {
             const replyDiv = document.createElement('div');
             replyDiv.style.cssText = `
                 padding: 16px 20px;
@@ -1838,9 +2889,14 @@
 
             const replyId = this.getReplyId(reply);
             const isConversationActive = activeConversationReplyId && replyId === activeConversationReplyId;
+            const isAiActive = activeAIReplyId && replyId === activeAIReplyId;
+            const isAiLoading = aiLoadingReplyId && replyId === aiLoadingReplyId;
             if (activeConversationReplyId && replyId === activeConversationReplyId) {
                 replyDiv.style.boxShadow = 'inset 3px 0 0 #00a1d6';
                 replyDiv.style.background = '#252525';
+            } else if (activeAIReplyId && replyId === activeAIReplyId) {
+                replyDiv.style.boxShadow = 'inset 3px 0 0 #ff9f40';
+                replyDiv.style.background = '#2a2620';
             }
 
             replyDiv.onmouseover = () => {
@@ -1848,7 +2904,13 @@
             };
 
             replyDiv.onmouseout = () => {
-                replyDiv.style.backgroundColor = isConversationActive ? '#252525' : '#1f1f1f';
+                if (isConversationActive) {
+                    replyDiv.style.backgroundColor = '#252525';
+                } else if (isAiActive) {
+                    replyDiv.style.backgroundColor = '#2a2620';
+                } else {
+                    replyDiv.style.backgroundColor = '#1f1f1f';
+                }
             };
 
             // 用户头像 - 模仿Bilibili原生尺寸
@@ -2050,6 +3112,50 @@
                 actions.appendChild(conversationBtn);
             }
 
+            if (typeof onGenerateAiRebuttal === 'function') {
+                const aiBtn = document.createElement('button');
+                aiBtn.type = 'button';
+                aiBtn.textContent = isAiLoading
+                    ? '生成中...'
+                    : (isAiActive ? '重新生成反对意见' : '一键生成反对意见');
+                aiBtn.style.cssText = `
+                    border: 1px solid ${isAiActive ? '#ff9f40' : '#4a4a4a'};
+                    background: ${isAiActive ? 'rgba(255, 159, 64, 0.12)' : '#2a2a2a'};
+                    color: ${isAiActive ? '#ffb86c' : '#c9ccd1'};
+                    border-radius: 4px;
+                    font-size: 12px;
+                    padding: 4px 8px;
+                    cursor: ${isAiLoading ? 'default' : 'pointer'};
+                    transition: all 0.2s ease;
+                    opacity: ${isAiLoading ? '0.75' : '1'};
+                `;
+
+                aiBtn.onmouseover = () => {
+                    if (!isAiActive && !isAiLoading) {
+                        aiBtn.style.borderColor = '#ff9f40';
+                        aiBtn.style.color = '#ffb86c';
+                    }
+                };
+
+                aiBtn.onmouseout = () => {
+                    if (!isAiActive && !isAiLoading) {
+                        aiBtn.style.borderColor = '#4a4a4a';
+                        aiBtn.style.color = '#c9ccd1';
+                    }
+                };
+
+                aiBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (isAiLoading) {
+                        return;
+                    }
+                    onGenerateAiRebuttal(reply);
+                };
+
+                actions.appendChild(aiBtn);
+            }
+
             content.appendChild(userInfo);
             content.appendChild(messageDiv);
             content.appendChild(actions);
@@ -2064,6 +3170,10 @@
             try {
                 this.domWatcher.destroy();
                 this.commentAPI.clearCache();
+                if (this.settingsModalElements?.overlay?.parentNode) {
+                    this.settingsModalElements.overlay.remove();
+                }
+                this.settingsModalElements = null;
                 this.isInitialized = false;
                 Utils.log('info', 'Bilibili评论展开助手脚本已销毁');
             } catch (error) {
@@ -2129,6 +3239,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.0 已加载 - 优化按钮附加和用户体验');
+    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.2 已加载 - 新增AI反对意见与脚本菜单设置');
 
 })();
