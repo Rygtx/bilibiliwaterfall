@@ -1463,6 +1463,72 @@
             return `${this.getReplyFloorValue(reply, replyFloorMap)}楼`;
         }
 
+        getReplyAuthorIdentity(reply) {
+            const rawMid = reply?.member?.mid ?? reply?.mid;
+            const mid = rawMid === undefined || rawMid === null ? '' : String(rawMid).trim();
+            if (mid) {
+                return {
+                    key: `mid:${mid}`,
+                    name: reply?.member?.uname || '匿名用户'
+                };
+            }
+
+            const uname = String(reply?.member?.uname || '').trim();
+            if (uname) {
+                return {
+                    key: `uname:${uname}`,
+                    name: uname
+                };
+            }
+
+            const fallbackReplyId = this.getReplyId(reply);
+            return {
+                key: fallbackReplyId ? `rpid:${fallbackReplyId}` : 'anonymous',
+                name: '匿名用户'
+            };
+        }
+
+        collectAuthorReplies(targetReply, replies, replyFloorMap) {
+            const targetAuthor = this.getReplyAuthorIdentity(targetReply);
+            const sourceReplies = Array.isArray(replies) ? replies : [];
+            const matchedReplies = sourceReplies.filter((item) => {
+                return this.getReplyAuthorIdentity(item).key === targetAuthor.key;
+            });
+
+            matchedReplies.sort((a, b) => {
+                let floorA = Number.MAX_SAFE_INTEGER;
+                let floorB = Number.MAX_SAFE_INTEGER;
+                try {
+                    floorA = this.getReplyFloorValue(a, replyFloorMap);
+                } catch (error) {
+                    floorA = Number.MAX_SAFE_INTEGER;
+                }
+                try {
+                    floorB = this.getReplyFloorValue(b, replyFloorMap);
+                } catch (error) {
+                    floorB = Number.MAX_SAFE_INTEGER;
+                }
+
+                if (floorA !== floorB) {
+                    return floorA - floorB;
+                }
+
+                const timeA = Number(a?.ctime || 0);
+                const timeB = Number(b?.ctime || 0);
+                if (timeA !== timeB) {
+                    return timeA - timeB;
+                }
+
+                return this.getReplyId(a).localeCompare(this.getReplyId(b));
+            });
+
+            return {
+                authorKey: targetAuthor.key,
+                authorName: targetAuthor.name,
+                matchedReplies
+            };
+        }
+
         buildAiAnalysisContext(replies, replyFloorMap, rootComment) {
             const sortedReplies = [...replies].sort((a, b) => {
                 const floorA = this.getReplyFloorValue(a, replyFloorMap);
@@ -1503,14 +1569,16 @@
             const targetMessage = String(targetReply.content?.message || '').replace(/\s+/g, ' ').trim();
 
             const systemPrompt = [
-                '你是一个理性、克制的中文辩论助手。',
-                '目标：只针对指定目标楼层生成一段反对意见。',
-                '其他楼层只能用于理解上下文，不要逐条反驳其他人。',
-                '要求：',
-                '1) 直接输出可发布的中文回复，不要输出分析过程。',
-                '2) 先简短承认对方一个合理点，再提出核心反驳。',
-                '3) 不要人身攻击，不要辱骂，不要极端词。',
-                '4) 长度控制在80-180字。'
+                '你是一个强硬、犀利、压迫感强的中文辩论写手。',
+                '目标：只针对指定目标楼层生成一段反驳回复。',
+                '其他楼层只能用于理解上下文，不要逐条点名回复其他人。',
+                '硬性要求：',
+                '1) 直接输出可发布的中文成稿，不要输出分析过程，不要写标题。',
+                '2) 开头直接切入反驳，不要先礼貌性承认对方观点。',
+                '3) 围绕对方核心论点连续进攻，给出多个有区分度的反驳点并形成压制。',
+                '4) 可使用反问、对比、类比增强力度，但禁止人身攻击、辱骂、歧视、威胁。',
+                '5) 结尾给出明确结论或行动主张，避免模糊收尾。',
+                '6) 篇幅要充分展开，信息密度高，避免空话和套话。'
             ].join('\n');
 
             const userPrompt = [
@@ -1520,12 +1588,64 @@
                 '请仅针对下面这个目标楼层发言生成反对意见：',
                 `目标楼层: ${targetFloor}`,
                 `目标作者: ${targetAuthor}`,
-                `目标内容: ${targetMessage}`
+                `目标内容: ${targetMessage}`,
+                '',
+                '输出要求补充：语气要硬、论证要密，正文要有完整展开，避免短促敷衍。'
             ].join('\n');
 
             return {
                 systemPrompt,
                 userPrompt
+            };
+        }
+
+        buildAiAuthorPrompt(targetReply, replies, replyFloorMap, rootComment) {
+            const { contextText } = this.buildAiAnalysisContext(replies, replyFloorMap, rootComment);
+            const authorContext = this.collectAuthorReplies(targetReply, replies, replyFloorMap);
+            const authorName = authorContext.authorName || targetReply.member?.uname || '匿名用户';
+            const targetReplies = authorContext.matchedReplies || [];
+
+            if (targetReplies.length === 0) {
+                throw new Error('未找到目标作者的可用回复，无法生成作者全集反对意见');
+            }
+
+            const targetLines = targetReplies.map((reply) => {
+                const floorLabel = this.getReplyDisplayFloor(reply, replyFloorMap);
+                const message = String(reply.content?.message || '').replace(/\s+/g, ' ').trim();
+                return `[${floorLabel}] 内容:${message || '[空内容]'}`;
+            });
+
+            const systemPrompt = [
+                '你是一个强硬、犀利、压迫感强的中文辩论写手。',
+                '目标：只针对指定目标作者在当前楼层中的全部发言，生成一段统一反驳回复。',
+                '其他作者发言只能用于理解上下文，不要逐条点名回复其他人。',
+                '硬性要求：',
+                '1) 直接输出可发布的中文成稿，不要输出分析过程，不要写标题。',
+                '2) 开头直接切入反驳，不要先礼貌性承认对方观点。',
+                '3) 必须综合该作者多条发言做整体反驳，覆盖其主要观点和重复论点。',
+                '4) 可使用反问、对比、类比增强力度，但禁止人身攻击、辱骂、歧视、威胁。',
+                '5) 结尾给出明确结论或行动主张，避免模糊收尾。',
+                '6) 篇幅要充分展开，信息密度高，避免空话和套话。'
+            ].join('\n');
+
+            const userPrompt = [
+                '以下是完整楼层上下文（含楼主与全部回复），供你理解前因后果：',
+                contextText || '无',
+                '',
+                '请仅针对下面这个目标作者的全部发言生成反对意见：',
+                `目标作者: ${authorName}`,
+                `目标发言数量: ${targetReplies.length}`,
+                '目标发言列表:',
+                targetLines.join('\n'),
+                '',
+                '输出要求补充：语气要硬、论证要密，正文要有完整展开，避免短促敷衍。'
+            ].join('\n');
+
+            return {
+                systemPrompt,
+                userPrompt,
+                authorName,
+                targetReplies
             };
         }
 
@@ -1684,7 +1804,7 @@
             });
         }
 
-        async generateAIRebuttal(targetReply, replies, replyFloorMap, rootComment) {
+        async requestAIRebuttalText(systemPrompt, userPrompt) {
             const settings = this.getSettings();
             const apiKey = (settings.openAIApiKey || '').trim();
             const endpointConfig = this.buildOpenAIEndpointConfig(settings.openAIBaseUrl || '', settings.openAIEndpointType || '');
@@ -1707,12 +1827,12 @@
                 throw new Error('请先在脚本设置中填写模型名称');
             }
 
-            const { systemPrompt, userPrompt } = this.buildAiPrompt(targetReply, replies, replyFloorMap, rootComment);
             const endpointType = endpointConfig.endpointType;
             const payload = endpointType === 'responses'
                 ? {
                     model,
-                    temperature: 0.7,
+                    temperature: 0.9,
+                    max_output_tokens: 700,
                     input: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
@@ -1720,7 +1840,8 @@
                 }
                 : {
                     model,
-                    temperature: 0.7,
+                    temperature: 0.9,
+                    max_tokens: 700,
                     messages: [
                         { role: 'system', content: systemPrompt },
                         { role: 'user', content: userPrompt }
@@ -1751,6 +1872,16 @@
             }
 
             return aiText;
+        }
+
+        async generateAIRebuttal(targetReply, replies, replyFloorMap, rootComment) {
+            const { systemPrompt, userPrompt } = this.buildAiPrompt(targetReply, replies, replyFloorMap, rootComment);
+            return this.requestAIRebuttalText(systemPrompt, userPrompt);
+        }
+
+        async generateAIAuthorRebuttal(targetReply, replies, replyFloorMap, rootComment) {
+            const { systemPrompt, userPrompt } = this.buildAiAuthorPrompt(targetReply, replies, replyFloorMap, rootComment);
+            return this.requestAIRebuttalText(systemPrompt, userPrompt);
         }
 
         setupEventHandlers() {
@@ -2103,27 +2234,69 @@
             `;
             conversationTitle.textContent = '回复对话';
 
-            const conversationCloseBtn = document.createElement('button');
-            conversationCloseBtn.type = 'button';
-            conversationCloseBtn.style.cssText = `
-                border: 1px solid #4a4a4a;
-                background: #2a2a2a;
-                color: #9499a0;
-                border-radius: 4px;
-                font-size: 12px;
-                padding: 2px 8px;
-                cursor: pointer;
-                transition: all 0.2s ease;
+            const getPanelHeaderIconSvg = (iconType) => {
+                if (iconType === 'close') {
+                    return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true">
+                        <path d="M7 7l10 10M17 7L7 17" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                    </svg>`;
+                }
+                if (iconType === 'restore') {
+                    return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true">
+                        <rect x="7" y="9" width="10" height="8" rx="1.5" stroke="currentColor" stroke-width="1.8"/>
+                        <path d="M9 9V7.8A1.8 1.8 0 0 1 10.8 6h5.4A1.8 1.8 0 0 1 18 7.8V13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                    </svg>`;
+                }
+                return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" aria-hidden="true">
+                    <rect x="6.5" y="6.5" width="11" height="11" rx="1.6" stroke="currentColor" stroke-width="1.8"/>
+                </svg>`;
+            };
+
+            const setPanelHeaderButtonIcon = (button, iconType, titleText) => {
+                button.innerHTML = getPanelHeaderIconSvg(iconType);
+                button.title = titleText;
+                button.setAttribute('aria-label', titleText);
+                button.dataset.iconType = iconType;
+            };
+
+            const createPanelHeaderButton = (iconType, titleText) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.style.cssText = `
+                    border: 1px solid #4a4a4a;
+                    background: #2a2a2a;
+                    color: #9499a0;
+                    border-radius: 4px;
+                    width: 24px;
+                    height: 24px;
+                    padding: 0;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    cursor: pointer;
+                    transition: all 0.2s ease;
+                `;
+                setPanelHeaderButtonIcon(button, iconType, titleText);
+                button.onmouseover = () => {
+                    button.style.borderColor = '#00a1d6';
+                    button.style.color = '#00a1d6';
+                };
+                button.onmouseout = () => {
+                    button.style.borderColor = '#4a4a4a';
+                    button.style.color = '#9499a0';
+                };
+                return button;
+            };
+
+            const conversationMaxBtn = createPanelHeaderButton('maximize', '最大化');
+            const conversationCloseBtn = createPanelHeaderButton('close', '关闭');
+            const conversationActions = document.createElement('div');
+            conversationActions.style.cssText = `
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
             `;
-            conversationCloseBtn.textContent = '关闭';
-            conversationCloseBtn.onmouseover = () => {
-                conversationCloseBtn.style.borderColor = '#00a1d6';
-                conversationCloseBtn.style.color = '#00a1d6';
-            };
-            conversationCloseBtn.onmouseout = () => {
-                conversationCloseBtn.style.borderColor = '#4a4a4a';
-                conversationCloseBtn.style.color = '#9499a0';
-            };
+            conversationActions.appendChild(conversationMaxBtn);
+            conversationActions.appendChild(conversationCloseBtn);
 
             const conversationBody = document.createElement('div');
             conversationBody.style.cssText = `
@@ -2135,7 +2308,7 @@
             `;
 
             conversationHeader.appendChild(conversationTitle);
-            conversationHeader.appendChild(conversationCloseBtn);
+            conversationHeader.appendChild(conversationActions);
             conversationPanel.appendChild(conversationHeader);
             conversationPanel.appendChild(conversationBody);
 
@@ -2174,27 +2347,16 @@
             `;
             aiTitle.textContent = 'AI反对意见';
 
-            const aiCloseBtn = document.createElement('button');
-            aiCloseBtn.type = 'button';
-            aiCloseBtn.style.cssText = `
-                border: 1px solid #4a4a4a;
-                background: #2a2a2a;
-                color: #9499a0;
-                border-radius: 4px;
-                font-size: 12px;
-                padding: 2px 8px;
-                cursor: pointer;
-                transition: all 0.2s ease;
+            const aiMaxBtn = createPanelHeaderButton('maximize', '最大化');
+            const aiCloseBtn = createPanelHeaderButton('close', '关闭');
+            const aiActions = document.createElement('div');
+            aiActions.style.cssText = `
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
             `;
-            aiCloseBtn.textContent = '关闭';
-            aiCloseBtn.onmouseover = () => {
-                aiCloseBtn.style.borderColor = '#00a1d6';
-                aiCloseBtn.style.color = '#00a1d6';
-            };
-            aiCloseBtn.onmouseout = () => {
-                aiCloseBtn.style.borderColor = '#4a4a4a';
-                aiCloseBtn.style.color = '#9499a0';
-            };
+            aiActions.appendChild(aiMaxBtn);
+            aiActions.appendChild(aiCloseBtn);
 
             const aiBody = document.createElement('div');
             aiBody.style.cssText = `
@@ -2209,7 +2371,7 @@
             `;
 
             aiHeader.appendChild(aiTitle);
-            aiHeader.appendChild(aiCloseBtn);
+            aiHeader.appendChild(aiActions);
             aiPanel.appendChild(aiHeader);
             aiPanel.appendChild(aiBody);
 
@@ -2224,17 +2386,181 @@
             let aiRebuttalEnabled = Boolean(this.settings.enableAiRebuttal);
             let activeAIReplyId = '';
             let aiLoadingReplyId = '';
+            let aiTaskMode = '';
             let aiTargetReply = null;
+            let aiTargetAuthorName = '';
+            let aiTargetAuthorReplies = [];
             let aiResultText = '';
             let aiErrorText = '';
-            const panelGap = 12;
-            const panelMargin = 12;
+            const panelGap = 16;
+            const panelMargin = 28;
+            const panelEdgeOffset = 24;
+            const conversationPanelState = {
+                isManualPosition: false,
+                isMaximized: false,
+                restoreRect: null,
+                defaultMaxWidth: ''
+            };
+            const aiPanelState = {
+                isManualPosition: false,
+                isMaximized: false,
+                restoreRect: null,
+                defaultMaxWidth: ''
+            };
+            conversationPanelState.defaultMaxWidth = conversationPanel.style.maxWidth || '';
+            aiPanelState.defaultMaxWidth = aiPanel.style.maxWidth || '';
 
-            const positionConversationPanel = () => {
+            const clampValue = (value, min, max) => Math.min(Math.max(value, min), max);
+
+            const setPanelRect = (panel, left, top, width, height) => {
+                if (Number.isFinite(Number(width)) && Number(width) > 0) {
+                    panel.style.width = `${Math.round(Number(width))}px`;
+                }
+                if (Number.isFinite(Number(height)) && Number(height) > 0) {
+                    panel.style.height = `${Math.round(Number(height))}px`;
+                }
+                panel.style.left = `${Math.round(Number(left))}px`;
+                panel.style.top = `${Math.round(Number(top))}px`;
+                panel.style.right = '';
+            };
+
+            const clampPanelToViewport = (panel) => {
+                const rect = panel.getBoundingClientRect();
+                const width = Math.min(rect.width || panel.offsetWidth || 320, Math.max(260, window.innerWidth - panelMargin * 2));
+                const height = Math.min(rect.height || panel.offsetHeight || 260, Math.max(180, window.innerHeight - panelMargin * 2));
+                const maxLeft = Math.max(panelMargin, window.innerWidth - width - panelMargin);
+                const maxTop = Math.max(panelMargin, window.innerHeight - height - panelMargin);
+                const left = clampValue(rect.left, panelMargin, maxLeft);
+                const top = clampValue(rect.top, panelMargin, maxTop);
+                setPanelRect(panel, left, top, width, height);
+            };
+
+            const applyMaximizedPanelSize = (panel, maxWidth, maxHeight) => {
+                const rect = panel.getBoundingClientRect();
+                const width = Math.min(
+                    Number(maxWidth),
+                    Math.floor(window.innerWidth * 0.66),
+                    Math.max(320, window.innerWidth - panelMargin)
+                );
+                const height = Math.min(
+                    Number(maxHeight),
+                    Math.floor(window.innerHeight * 0.84),
+                    Math.max(240, window.innerHeight - panelMargin)
+                );
+                const left = rect.left;
+                const top = rect.top;
+                setPanelRect(panel, left, top, width, height);
+            };
+
+            const togglePanelMaximize = (panel, state, maxButton, maxWidth, maxHeight, fallbackPositionFn) => {
+                if (!state.isMaximized) {
+                    const rect = panel.getBoundingClientRect();
+                    state.restoreRect = {
+                        left: rect.left,
+                        top: rect.top,
+                        width: rect.width || panel.offsetWidth || 320,
+                        height: rect.height || panel.offsetHeight || 260
+                    };
+                    state.isMaximized = true;
+                    state.isManualPosition = true;
+                    setPanelHeaderButtonIcon(maxButton, 'restore', '还原');
+                    panel.style.maxWidth = 'none';
+                    applyMaximizedPanelSize(panel, maxWidth, maxHeight);
+                    return;
+                }
+
+                state.isMaximized = false;
+                setPanelHeaderButtonIcon(maxButton, 'maximize', '最大化');
+                panel.style.maxWidth = state.defaultMaxWidth || '';
+                if (state.restoreRect) {
+                    const { left, top, width, height } = state.restoreRect;
+                    setPanelRect(panel, left, top, width, height);
+                    state.isManualPosition = true;
+                    return;
+                }
+
+                fallbackPositionFn(true);
+            };
+
+            const enablePanelDragging = (panel, dragHandle, panelState) => {
+                dragHandle.style.cursor = 'move';
+                dragHandle.style.userSelect = 'none';
+
+                dragHandle.addEventListener('mousedown', (event) => {
+                    if (event.button !== 0) {
+                        return;
+                    }
+                    if (event.target instanceof Element && event.target.closest('button')) {
+                        return;
+                    }
+
+                    const rect = panel.getBoundingClientRect();
+                    const width = rect.width || panel.offsetWidth || 320;
+                    const height = rect.height || panel.offsetHeight || 260;
+                    const offsetX = event.clientX - rect.left;
+                    const offsetY = event.clientY - rect.top;
+                    panelState.isManualPosition = true;
+
+                    const getDragBounds = () => {
+                        if (!panelState.isMaximized) {
+                            const minLeft = panelMargin;
+                            const maxLeft = Math.max(minLeft, window.innerWidth - width - panelMargin);
+                            const minTop = panelMargin;
+                            const maxTop = Math.max(minTop, window.innerHeight - height - panelMargin);
+                            return { minLeft, maxLeft, minTop, maxTop };
+                        }
+
+                        // 最大化后仍允许拖动，至少保留部分面板可见，避免“看起来无法拖动”。
+                        const minVisibleWidth = Math.min(width, Math.max(160, Math.floor(width * 0.35)));
+                        const minVisibleHeight = Math.min(height, 56);
+                        const minLeft = panelMargin - (width - minVisibleWidth);
+                        const maxLeft = Math.max(minLeft, window.innerWidth - minVisibleWidth - panelMargin);
+                        const minTop = panelMargin;
+                        const maxTop = Math.max(minTop, window.innerHeight - minVisibleHeight - panelMargin);
+                        return { minLeft, maxLeft, minTop, maxTop };
+                    };
+
+                    const onMouseMove = (moveEvent) => {
+                        const bounds = getDragBounds();
+                        const left = clampValue(moveEvent.clientX - offsetX, bounds.minLeft, bounds.maxLeft);
+                        const top = clampValue(moveEvent.clientY - offsetY, bounds.minTop, bounds.maxTop);
+                        setPanelRect(panel, left, top, width, height);
+                    };
+
+                    const onMouseUp = () => {
+                        document.removeEventListener('mousemove', onMouseMove);
+                        document.removeEventListener('mouseup', onMouseUp);
+                        document.body.style.userSelect = '';
+                    };
+
+                    document.addEventListener('mousemove', onMouseMove);
+                    document.addEventListener('mouseup', onMouseUp);
+                    document.body.style.userSelect = 'none';
+                    event.preventDefault();
+                });
+            };
+
+            const positionConversationPanel = (forceAuto = false) => {
+                if (forceAuto) {
+                    conversationPanelState.isManualPosition = false;
+                }
+
+                if (conversationPanelState.isMaximized) {
+                    applyMaximizedPanelSize(conversationPanel, 560, 700);
+                    return;
+                }
+
+                if (conversationPanelState.isManualPosition && !forceAuto) {
+                    clampPanelToViewport(conversationPanel);
+                    return;
+                }
+
                 if (!modalElement) {
-                    conversationPanel.style.right = `${panelMargin}px`;
-                    conversationPanel.style.top = `${panelMargin}px`;
-                    conversationPanel.style.height = `${Math.max(260, Math.floor(window.innerHeight * 0.7))}px`;
+                    const panelWidth = Math.min(360, Math.max(280, conversationPanel.offsetWidth || 340));
+                    const panelHeight = Math.max(260, Math.min(Math.floor(window.innerHeight * 0.72), 620));
+                    const left = Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin - panelEdgeOffset);
+                    const top = panelMargin + 8;
+                    setPanelRect(conversationPanel, left, top, panelWidth, panelHeight);
                     return;
                 }
 
@@ -2246,7 +2572,7 @@
                     left = modalRect.left - panelGap - panelWidth;
                 }
                 if (left < panelMargin) {
-                    left = Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin);
+                    left = clampValue(left, panelMargin, Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin - panelEdgeOffset));
                 }
 
                 const top = Math.max(panelMargin, Math.min(modalRect.top, window.innerHeight - 220));
@@ -2254,29 +2580,42 @@
                 const preferredHeight = Math.max(260, Math.min(modalRect.height, Math.floor(window.innerHeight * 0.8)));
                 const height = Math.min(preferredHeight, maxHeight);
 
-                conversationPanel.style.left = `${Math.round(left)}px`;
-                conversationPanel.style.top = `${Math.round(top)}px`;
-                conversationPanel.style.height = `${Math.round(height)}px`;
-                conversationPanel.style.right = '';
+                setPanelRect(conversationPanel, left, top, panelWidth, height);
             };
 
-            const positionAiPanel = () => {
+            const positionAiPanel = (forceAuto = false) => {
+                if (forceAuto) {
+                    aiPanelState.isManualPosition = false;
+                }
+
+                if (aiPanelState.isMaximized) {
+                    applyMaximizedPanelSize(aiPanel, 620, 720);
+                    return;
+                }
+
+                if (aiPanelState.isManualPosition && !forceAuto) {
+                    clampPanelToViewport(aiPanel);
+                    return;
+                }
+
                 if (!modalElement) {
-                    aiPanel.style.right = `${panelMargin}px`;
-                    aiPanel.style.top = `${Math.max(80, Math.floor(window.innerHeight * 0.24))}px`;
-                    aiPanel.style.height = `${Math.max(220, Math.floor(window.innerHeight * 0.56))}px`;
+                    const panelWidth = Math.min(390, Math.max(300, aiPanel.offsetWidth || 360));
+                    const panelHeight = Math.max(220, Math.min(Math.floor(window.innerHeight * 0.62), 560));
+                    const left = Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin - panelEdgeOffset);
+                    const top = Math.max(80, Math.floor(window.innerHeight * 0.2));
+                    setPanelRect(aiPanel, left, top, panelWidth, panelHeight);
                     return;
                 }
 
                 const modalRect = modalElement.getBoundingClientRect();
-                const panelWidth = Math.min(390, Math.max(280, aiPanel.offsetWidth || 360));
+                const panelWidth = Math.min(390, Math.max(300, aiPanel.offsetWidth || 360));
                 let left = modalRect.right + panelGap;
 
                 if (left + panelWidth + panelMargin > window.innerWidth) {
                     left = modalRect.left - panelGap - panelWidth;
                 }
                 if (left < panelMargin) {
-                    left = Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin);
+                    left = clampValue(left, panelMargin, Math.max(panelMargin, window.innerWidth - panelWidth - panelMargin - panelEdgeOffset));
                 }
 
                 const preferredHeight = Math.max(220, Math.min(Math.floor(window.innerHeight * 0.6), 520));
@@ -2284,11 +2623,11 @@
                 const maxTop = window.innerHeight - preferredHeight - panelMargin;
                 const top = Math.max(panelMargin, Math.min(topBase, maxTop));
 
-                aiPanel.style.left = `${Math.round(left)}px`;
-                aiPanel.style.top = `${Math.round(top)}px`;
-                aiPanel.style.height = `${Math.round(preferredHeight)}px`;
-                aiPanel.style.right = '';
+                setPanelRect(aiPanel, left, top, panelWidth, preferredHeight);
             };
+
+            enablePanelDragging(conversationPanel, conversationHeader, conversationPanelState);
+            enablePanelDragging(aiPanel, aiHeader, aiPanelState);
 
             const renderAIPanel = () => {
                 aiBody.innerHTML = '';
@@ -2296,7 +2635,7 @@
                 if (!aiTargetReply) {
                     const emptyText = document.createElement('div');
                     emptyText.style.cssText = 'color:#9499a0;font-size:13px;line-height:1.6;';
-                    emptyText.textContent = '点击回复下方的“生成反对意见”按钮后，这里会显示 AI 结果。';
+                    emptyText.textContent = '点击回复下方按钮后，这里会显示 AI 反对意见结果（支持单条和作者全集两种模式）。';
                     aiBody.appendChild(emptyText);
                     return;
                 }
@@ -2312,14 +2651,35 @@
                     gap: 6px;
                 `;
 
-                const floorLabel = this.getReplyDisplayFloor(aiTargetReply, replyFloorMap);
                 const targetHeader = document.createElement('div');
                 targetHeader.style.cssText = 'font-size:12px;color:#8ea2b0;';
-                targetHeader.textContent = `目标楼层: ${floorLabel} | 作者: ${aiTargetReply.member?.uname || '匿名用户'}`;
 
                 const targetMessage = document.createElement('div');
                 targetMessage.style.cssText = 'font-size:13px;color:#d0d2d6;line-height:1.6;white-space:pre-wrap;word-break:break-word;';
-                targetMessage.textContent = aiTargetReply.content?.message || '';
+
+                if (aiTaskMode === 'author_all') {
+                    const authorName = aiTargetAuthorName || aiTargetReply.member?.uname || '匿名用户';
+                    const matchedReplies = Array.isArray(aiTargetAuthorReplies) ? aiTargetAuthorReplies : [];
+                    targetHeader.textContent = `目标作者: ${authorName} | 覆盖回复: ${matchedReplies.length} 条`;
+
+                    const lines = matchedReplies.map((reply, index) => {
+                        let floorLabel = `${index + 1}楼`;
+                        try {
+                            floorLabel = this.getReplyDisplayFloor(reply, replyFloorMap);
+                        } catch (error) {
+                            floorLabel = `${index + 1}楼`;
+                        }
+                        const message = String(reply?.content?.message || '').trim();
+                        return `${floorLabel}: ${message || '[空内容]'}`;
+                    });
+                    targetMessage.style.maxHeight = '180px';
+                    targetMessage.style.overflowY = 'auto';
+                    targetMessage.textContent = lines.join('\n');
+                } else {
+                    const floorLabel = this.getReplyDisplayFloor(aiTargetReply, replyFloorMap);
+                    targetHeader.textContent = `目标楼层: ${floorLabel} | 作者: ${aiTargetReply.member?.uname || '匿名用户'}`;
+                    targetMessage.textContent = aiTargetReply.content?.message || '';
+                }
 
                 targetCard.appendChild(targetHeader);
                 targetCard.appendChild(targetMessage);
@@ -2328,7 +2688,9 @@
                 if (aiLoadingReplyId) {
                     const loadingText = document.createElement('div');
                     loadingText.style.cssText = 'font-size:13px;color:#40a9ff;line-height:1.6;';
-                    loadingText.textContent = 'AI 正在基于全部楼层分析并生成反对意见...';
+                    loadingText.textContent = aiTaskMode === 'author_all'
+                        ? 'AI 正在基于目标作者全部回复分析并生成反对意见...'
+                        : 'AI 正在基于全部楼层分析并生成反对意见...';
                     aiBody.appendChild(loadingText);
                     return;
                 }
@@ -2390,7 +2752,8 @@
                     activeConversationReplyId,
                     aiRebuttalEnabled ? handleGenerateAiRebuttal : null,
                     activeAIReplyId,
-                    aiLoadingReplyId
+                    aiLoadingReplyId,
+                    aiTaskMode
                 );
             };
 
@@ -2405,13 +2768,38 @@
             const hideAIPanel = () => {
                 activeAIReplyId = '';
                 aiLoadingReplyId = '';
+                aiTaskMode = '';
                 aiTargetReply = null;
+                aiTargetAuthorName = '';
+                aiTargetAuthorReplies = [];
                 aiResultText = '';
                 aiErrorText = '';
                 aiPanel.style.display = 'none';
                 aiTitle.textContent = 'AI反对意见';
                 aiBody.innerHTML = '';
                 renderReplies();
+            };
+
+            const toggleConversationPanelMaximize = () => {
+                togglePanelMaximize(
+                    conversationPanel,
+                    conversationPanelState,
+                    conversationMaxBtn,
+                    560,
+                    700,
+                    positionConversationPanel
+                );
+            };
+
+            const toggleAiPanelMaximize = () => {
+                togglePanelMaximize(
+                    aiPanel,
+                    aiPanelState,
+                    aiMaxBtn,
+                    620,
+                    720,
+                    positionAiPanel
+                );
             };
 
             const handleViewConversation = (reply) => {
@@ -2437,7 +2825,8 @@
                 renderReplies();
             };
 
-            const handleGenerateAiRebuttal = async (reply) => {
+            const handleGenerateAiRebuttal = async (reply, mode = 'single') => {
+                const taskMode = mode === 'author_all' ? 'author_all' : 'single';
                 const selectedReplyId = this.getReplyId(reply);
                 if (!selectedReplyId || aiLoadingReplyId) {
                     return;
@@ -2445,24 +2834,41 @@
 
                 activeAIReplyId = selectedReplyId;
                 aiLoadingReplyId = selectedReplyId;
+                aiTaskMode = taskMode;
                 aiTargetReply = reply;
+                if (taskMode === 'author_all') {
+                    const authorContext = this.collectAuthorReplies(reply, replies, replyFloorMap);
+                    aiTargetAuthorName = authorContext.authorName || reply.member?.uname || '匿名用户';
+                    aiTargetAuthorReplies = authorContext.matchedReplies || [];
+                } else {
+                    aiTargetAuthorName = '';
+                    aiTargetAuthorReplies = [];
+                }
                 aiErrorText = '';
                 aiResultText = '';
-                aiTitle.textContent = 'AI反对意见（分析中）';
+                aiTitle.textContent = taskMode === 'author_all'
+                    ? 'AI反对意见（作者全集分析中）'
+                    : 'AI反对意见（分析中）';
                 aiPanel.style.display = 'flex';
                 renderAIPanel();
                 positionAiPanel();
                 renderReplies();
 
                 try {
-                    const aiText = await this.generateAIRebuttal(reply, replies, replyFloorMap, rootComment);
+                    const aiText = taskMode === 'author_all'
+                        ? await this.generateAIAuthorRebuttal(reply, replies, replyFloorMap, rootComment)
+                        : await this.generateAIRebuttal(reply, replies, replyFloorMap, rootComment);
                     aiResultText = aiText;
                     aiErrorText = '';
-                    aiTitle.textContent = 'AI反对意见';
+                    aiTitle.textContent = taskMode === 'author_all'
+                        ? 'AI反对意见（作者全集）'
+                        : 'AI反对意见';
                 } catch (error) {
                     aiErrorText = error?.message || '生成反对意见失败';
                     aiResultText = '';
-                    aiTitle.textContent = 'AI反对意见（失败）';
+                    aiTitle.textContent = taskMode === 'author_all'
+                        ? 'AI反对意见（作者全集失败）'
+                        : 'AI反对意见（失败）';
                     Utils.log('error', '生成AI反对意见失败', error);
                 } finally {
                     aiLoadingReplyId = '';
@@ -2487,6 +2893,16 @@
             };
             window.addEventListener('bili-comment-expand-settings-changed', onSettingsChanged);
 
+            conversationMaxBtn.onclick = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                toggleConversationPanelMaximize();
+            };
+            aiMaxBtn.onclick = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                toggleAiPanelMaximize();
+            };
             conversationCloseBtn.onclick = hideConversationPanel;
             aiCloseBtn.onclick = hideAIPanel;
 
@@ -2835,7 +3251,8 @@
             activeConversationReplyId = '',
             onGenerateAiRebuttal = null,
             activeAIReplyId = '',
-            aiLoadingReplyId = ''
+            aiLoadingReplyId = '',
+            activeAITaskMode = ''
         ) {
             // 排序回复
             const sortedReplies = [...replies].sort((a, b) => {
@@ -2862,7 +3279,8 @@
                     activeConversationReplyId,
                     onGenerateAiRebuttal,
                     activeAIReplyId,
-                    aiLoadingReplyId
+                    aiLoadingReplyId,
+                    activeAITaskMode
                 );
                 container.appendChild(replyElement);
             });
@@ -2875,7 +3293,8 @@
             activeConversationReplyId = '',
             onGenerateAiRebuttal = null,
             activeAIReplyId = '',
-            aiLoadingReplyId = ''
+            aiLoadingReplyId = '',
+            activeAITaskMode = ''
         ) {
             const replyDiv = document.createElement('div');
             replyDiv.style.cssText = `
@@ -2891,6 +3310,10 @@
             const isConversationActive = activeConversationReplyId && replyId === activeConversationReplyId;
             const isAiActive = activeAIReplyId && replyId === activeAIReplyId;
             const isAiLoading = aiLoadingReplyId && replyId === aiLoadingReplyId;
+            const isSingleAiActive = isAiActive && activeAITaskMode === 'single';
+            const isSingleAiLoading = isAiLoading && activeAITaskMode === 'single';
+            const isAuthorAiActive = isAiActive && activeAITaskMode === 'author_all';
+            const isAuthorAiLoading = isAiLoading && activeAITaskMode === 'author_all';
             if (activeConversationReplyId && replyId === activeConversationReplyId) {
                 replyDiv.style.boxShadow = 'inset 3px 0 0 #00a1d6';
                 replyDiv.style.background = '#252525';
@@ -3115,30 +3538,30 @@
             if (typeof onGenerateAiRebuttal === 'function') {
                 const aiBtn = document.createElement('button');
                 aiBtn.type = 'button';
-                aiBtn.textContent = isAiLoading
+                aiBtn.textContent = isSingleAiLoading
                     ? '生成中...'
-                    : (isAiActive ? '重新生成反对意见' : '一键生成反对意见');
+                    : (isSingleAiActive ? '重新生成反对意见' : '一键生成反对意见');
                 aiBtn.style.cssText = `
-                    border: 1px solid ${isAiActive ? '#ff9f40' : '#4a4a4a'};
-                    background: ${isAiActive ? 'rgba(255, 159, 64, 0.12)' : '#2a2a2a'};
-                    color: ${isAiActive ? '#ffb86c' : '#c9ccd1'};
+                    border: 1px solid ${isSingleAiActive ? '#ff9f40' : '#4a4a4a'};
+                    background: ${isSingleAiActive ? 'rgba(255, 159, 64, 0.12)' : '#2a2a2a'};
+                    color: ${isSingleAiActive ? '#ffb86c' : '#c9ccd1'};
                     border-radius: 4px;
                     font-size: 12px;
                     padding: 4px 8px;
-                    cursor: ${isAiLoading ? 'default' : 'pointer'};
+                    cursor: ${isSingleAiLoading ? 'default' : 'pointer'};
                     transition: all 0.2s ease;
-                    opacity: ${isAiLoading ? '0.75' : '1'};
+                    opacity: ${isSingleAiLoading ? '0.75' : '1'};
                 `;
 
                 aiBtn.onmouseover = () => {
-                    if (!isAiActive && !isAiLoading) {
+                    if (!isSingleAiActive && !isSingleAiLoading) {
                         aiBtn.style.borderColor = '#ff9f40';
                         aiBtn.style.color = '#ffb86c';
                     }
                 };
 
                 aiBtn.onmouseout = () => {
-                    if (!isAiActive && !isAiLoading) {
+                    if (!isSingleAiActive && !isSingleAiLoading) {
                         aiBtn.style.borderColor = '#4a4a4a';
                         aiBtn.style.color = '#c9ccd1';
                     }
@@ -3147,13 +3570,55 @@
                 aiBtn.onclick = (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    if (isAiLoading) {
+                    if (isSingleAiLoading) {
                         return;
                     }
-                    onGenerateAiRebuttal(reply);
+                    onGenerateAiRebuttal(reply, 'single');
                 };
 
                 actions.appendChild(aiBtn);
+
+                const authorAiBtn = document.createElement('button');
+                authorAiBtn.type = 'button';
+                authorAiBtn.textContent = isAuthorAiLoading
+                    ? '生成中...'
+                    : (isAuthorAiActive ? '重新生成(作者全集)' : '按作者全部回复生成');
+                authorAiBtn.style.cssText = `
+                    border: 1px solid ${isAuthorAiActive ? '#73d13d' : '#4a4a4a'};
+                    background: ${isAuthorAiActive ? 'rgba(115, 209, 61, 0.14)' : '#2a2a2a'};
+                    color: ${isAuthorAiActive ? '#95de64' : '#c9ccd1'};
+                    border-radius: 4px;
+                    font-size: 12px;
+                    padding: 4px 8px;
+                    cursor: ${isAuthorAiLoading ? 'default' : 'pointer'};
+                    transition: all 0.2s ease;
+                    opacity: ${isAuthorAiLoading ? '0.75' : '1'};
+                `;
+
+                authorAiBtn.onmouseover = () => {
+                    if (!isAuthorAiActive && !isAuthorAiLoading) {
+                        authorAiBtn.style.borderColor = '#73d13d';
+                        authorAiBtn.style.color = '#95de64';
+                    }
+                };
+
+                authorAiBtn.onmouseout = () => {
+                    if (!isAuthorAiActive && !isAuthorAiLoading) {
+                        authorAiBtn.style.borderColor = '#4a4a4a';
+                        authorAiBtn.style.color = '#c9ccd1';
+                    }
+                };
+
+                authorAiBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (isAuthorAiLoading) {
+                        return;
+                    }
+                    onGenerateAiRebuttal(reply, 'author_all');
+                };
+
+                actions.appendChild(authorAiBtn);
             }
 
             content.appendChild(userInfo);
