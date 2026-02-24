@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    https://violentmonkey.github.io/
-// @version      2.5.4
+// @version      2.5.5
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
@@ -43,6 +43,12 @@
         enableAiRebuttal: false,
         enableDebugLogs: false
     };
+
+    const AI_PROMPT_STYLE_OPTIONS = [
+        { value: 'classic_structured', label: '强硬辩驳（直切要点）' },
+        { value: 'colloquial_adaptive', label: '口语自适应（AI自行决定）' }
+    ];
+    const DEFAULT_AI_PROMPT_STYLE = 'colloquial_adaptive';
 
     function readSettingsFromScriptStorage() {
         if (typeof GM_getValue !== 'function') {
@@ -1580,7 +1586,7 @@
 
             const tips = document.createElement('div');
             tips.style.cssText = 'font-size: 12px; color: #7f858c; line-height: 1.5;';
-            tips.textContent = '设置会保存在 Violentmonkey 脚本存储。请求基础地址请填写到 /v1；接口类型在下拉框选择。调试日志开关在脚本菜单中与设置并列。';
+            tips.textContent = '设置会保存在 Violentmonkey 脚本存储。请求基础地址请填写到 /v1；接口类型在下拉框选择。提示词风格会在每次生成前弹窗选择。调试日志开关在脚本菜单中与设置并列。';
 
             const footer = document.createElement('div');
             footer.style.cssText = `
@@ -1655,6 +1661,166 @@
 
         normalizeOpenAIEndpointType(endpointType) {
             return endpointType === 'chat_completions' ? 'chat_completions' : 'responses';
+        }
+
+        normalizeAIPromptStyle(promptStyle) {
+            const validValues = new Set(AI_PROMPT_STYLE_OPTIONS.map(option => option.value));
+            const value = String(promptStyle || '').trim();
+            if (validValues.has(value)) {
+                return value;
+            }
+            return DEFAULT_AI_PROMPT_STYLE;
+        }
+
+        getAIPromptStyleLabel(promptStyle) {
+            const normalizedStyle = this.normalizeAIPromptStyle(promptStyle);
+            const matchedOption = AI_PROMPT_STYLE_OPTIONS.find(option => option.value === normalizedStyle);
+            return matchedOption?.label || '口语自适应（AI自行决定）';
+        }
+
+        promptAiStyleSelection(mode = 'single') {
+            const taskMode = mode === 'author_all' ? 'author_all' : 'single';
+            const modeText = taskMode === 'author_all' ? '按作者全部回复生成' : '单条回复生成';
+
+            return new Promise((resolve) => {
+                const overlay = document.createElement('div');
+                overlay.style.cssText = `
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(0, 0, 0, 0.68);
+                    z-index: 10008;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 16px;
+                `;
+
+                const modal = document.createElement('div');
+                modal.style.cssText = `
+                    width: min(500px, calc(100vw - 24px));
+                    border: 1px solid #3a3a3a;
+                    border-radius: 10px;
+                    background: #1f1f1f;
+                    color: #e1e2e3;
+                    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.5);
+                    overflow: hidden;
+                `;
+
+                const header = document.createElement('div');
+                header.style.cssText = `
+                    padding: 14px 16px 10px;
+                    border-bottom: 1px solid #333;
+                `;
+
+                const title = document.createElement('div');
+                title.style.cssText = 'font-size: 14px; font-weight: 600; color: #e1e2e3;';
+                title.textContent = '选择本次提示词风格';
+
+                const subtitle = document.createElement('div');
+                subtitle.style.cssText = 'margin-top: 6px; font-size: 12px; color: #9499a0;';
+                subtitle.textContent = `当前操作：${modeText}`;
+
+                header.appendChild(title);
+                header.appendChild(subtitle);
+
+                const body = document.createElement('div');
+                body.style.cssText = `
+                    padding: 12px 16px 16px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 8px;
+                `;
+
+                const closeHandlers = [];
+                let hasClosed = false;
+                const closeModal = (selectedStyle = null) => {
+                    if (hasClosed) {
+                        return;
+                    }
+                    hasClosed = true;
+                    closeHandlers.forEach(fn => {
+                        try {
+                            fn();
+                        } catch (error) {
+                            Utils.log('warn', '清理风格选择弹窗事件失败', error);
+                        }
+                    });
+                    if (overlay.parentNode) {
+                        overlay.remove();
+                    }
+                    resolve(selectedStyle);
+                };
+
+                AI_PROMPT_STYLE_OPTIONS.forEach((option) => {
+                    const styleButton = document.createElement('button');
+                    styleButton.type = 'button';
+                    styleButton.style.cssText = `
+                        border: 1px solid #4a4a4a;
+                        background: #262626;
+                        color: #e1e2e3;
+                        border-radius: 8px;
+                        padding: 10px 12px;
+                        font-size: 13px;
+                        text-align: left;
+                        cursor: pointer;
+                        transition: all 0.2s ease;
+                    `;
+                    styleButton.textContent = option.label;
+                    styleButton.onmouseover = () => {
+                        styleButton.style.borderColor = '#00a1d6';
+                        styleButton.style.background = '#2c2c2c';
+                    };
+                    styleButton.onmouseout = () => {
+                        styleButton.style.borderColor = '#4a4a4a';
+                        styleButton.style.background = '#262626';
+                    };
+                    styleButton.onclick = () => closeModal(option.value);
+                    body.appendChild(styleButton);
+                });
+
+                const footer = document.createElement('div');
+                footer.style.cssText = `
+                    padding: 0 16px 16px;
+                    display: flex;
+                    justify-content: flex-end;
+                `;
+
+                const cancelBtn = document.createElement('button');
+                cancelBtn.type = 'button';
+                cancelBtn.style.cssText = `
+                    border: 1px solid #4a4a4a;
+                    background: #2d2d2d;
+                    color: #c9ccd1;
+                    border-radius: 6px;
+                    font-size: 12px;
+                    padding: 6px 12px;
+                    cursor: pointer;
+                `;
+                cancelBtn.textContent = '取消';
+                cancelBtn.onclick = () => closeModal(null);
+
+                footer.appendChild(cancelBtn);
+
+                const onEscClose = (event) => {
+                    if (event.key === 'Escape') {
+                        closeModal(null);
+                    }
+                };
+                document.addEventListener('keydown', onEscClose);
+                closeHandlers.push(() => document.removeEventListener('keydown', onEscClose));
+
+                overlay.addEventListener('click', (event) => {
+                    if (event.target === overlay) {
+                        closeModal(null);
+                    }
+                });
+
+                modal.appendChild(header);
+                modal.appendChild(body);
+                modal.appendChild(footer);
+                overlay.appendChild(modal);
+                document.body.appendChild(overlay);
+            });
         }
 
         normalizeOpenAIBaseUrl(rawUrl) {
@@ -1819,23 +1985,89 @@
             };
         }
 
-        buildAiPrompt(targetReply, replies, replyFloorMap, rootComment) {
+        buildAiStyleProfile(styleKey = DEFAULT_AI_PROMPT_STYLE, mode = 'single') {
+            const normalizedStyleKey = this.normalizeAIPromptStyle(styleKey);
+            const stylePresets = {
+                colloquial_adaptive: {
+                    styleName: '口语自适应（AI自行决定）',
+                    tone: '保持口语化、通俗、自然，不端着写',
+                    opening: '开头直接进入核心争议点，避免固定模板开场',
+                    progression: '根据目标内容自适应组织逻辑，不强制固定套路',
+                    ending: '结尾明确表态或给出具体主张，不要含糊',
+                    sentenceRhythm: '句长自然变化，像真实评论互动',
+                    lexicalStyle: '在合适时可使用反问或类比，但仅在能增强说服力时使用'
+                }
+            };
+
+            const selected = stylePresets[normalizedStyleKey] || stylePresets[DEFAULT_AI_PROMPT_STYLE];
+
+            return {
+                mode,
+                styleKey: normalizedStyleKey,
+                styleName: selected.styleName,
+                tone: selected.tone,
+                opening: selected.opening,
+                progression: selected.progression,
+                ending: selected.ending,
+                sentenceRhythm: selected.sentenceRhythm,
+                lexicalStyle: selected.lexicalStyle,
+                lengthHint: mode === 'author_all' ? '220-420字' : '140-280字'
+            };
+        }
+
+        buildAiPrompt(targetReply, replies, replyFloorMap, rootComment, promptStyle = DEFAULT_AI_PROMPT_STYLE) {
             const { contextText } = this.buildAiAnalysisContext(replies, replyFloorMap, rootComment);
             const targetFloor = this.getReplyDisplayFloor(targetReply, replyFloorMap);
             const targetAuthor = targetReply.member?.uname || '匿名用户';
             const targetMessage = String(targetReply.content?.message || '').replace(/\s+/g, ' ').trim();
+            const selectedPromptStyle = this.normalizeAIPromptStyle(promptStyle);
+
+            if (selectedPromptStyle === 'classic_structured') {
+                const systemPrompt = [
+                    '你是一个强硬、犀利、压迫感强的中文辩论写手。',
+                    '目标：只针对指定目标楼层生成一段反驳回复。',
+                    '其他楼层只能用于理解上下文，不要逐条点名回复其他人。',
+                    '硬性要求：',
+                    '1) 直接输出可发布的中文成稿，不要输出分析过程，不要写标题。',
+                    '2) 开头直接切入反驳，不要先礼貌性承认对方观点。',
+                    '3) 围绕对方核心论点连续进攻，给出多个有区分度的反驳点并形成压制。',
+                    '4) 可使用反问、对比、类比增强力度，但禁止人身攻击、辱骂、歧视、威胁。',
+                    '5) 结尾给出明确结论或行动主张，避免模糊收尾。',
+                    '6) 篇幅要充分展开，信息密度高，避免空话和套话。'
+                ].join('\n');
+
+                const userPrompt = [
+                    '以下是完整楼层上下文（含楼主与全部回复），供你理解前因后果：',
+                    contextText || '无',
+                    '',
+                    '请仅针对下面这个目标楼层发言生成反对意见：',
+                    `目标楼层: ${targetFloor}`,
+                    `目标作者: ${targetAuthor}`,
+                    `目标内容: ${targetMessage}`,
+                    '',
+                    '输出要求补充：语气要硬、论证要密，正文要有完整展开，避免短促敷衍。'
+                ].join('\n');
+
+                return {
+                    systemPrompt,
+                    userPrompt
+                };
+            }
+
+            const styleProfile = this.buildAiStyleProfile(selectedPromptStyle, 'single');
 
             const systemPrompt = [
-                '你是一个强硬、犀利、压迫感强的中文辩论写手。',
-                '目标：只针对指定目标楼层生成一段反驳回复。',
-                '其他楼层只能用于理解上下文，不要逐条点名回复其他人。',
-                '硬性要求：',
-                '1) 直接输出可发布的中文成稿，不要输出分析过程，不要写标题。',
-                '2) 开头直接切入反驳，不要先礼貌性承认对方观点。',
-                '3) 围绕对方核心论点连续进攻，给出多个有区分度的反驳点并形成压制。',
-                '4) 可使用反问、对比、类比增强力度，但禁止人身攻击、辱骂、歧视、威胁。',
-                '5) 结尾给出明确结论或行动主张，避免模糊收尾。',
-                '6) 篇幅要充分展开，信息密度高，避免空话和套话。'
+                '你是B站评论区里会讲人话的辩手，写作风格要像真实用户即时回复。',
+                '任务：只针对指定目标楼层生成一段反驳，不要逐条点评其他楼层。',
+                '输出规则：',
+                '1) 只输出可直接发布的正文，不要标题、不要分析过程，也不需要分点编号。',
+                '2) 口语化、通俗易懂，像评论区真人即时回复，避免公文腔和论文腔。',
+                '3) 优先围绕目标观点持续反驳，尽量打中具体论点，避免空对空。',
+                '4) 反问、类比、对比可按需要自然使用，由你判断何时最有说服力。',
+                '5) 连接词和句式可自由发挥，重点是表达自然、逻辑清楚，不要生硬堆砌。',
+                '6) 结尾可给出明确判断或行动主张，让立场清晰。',
+                `7) 字数建议：${styleProfile.lengthHint}。`,
+                `本次风格：${styleProfile.styleName}。${styleProfile.tone}；${styleProfile.opening}；${styleProfile.progression}；${styleProfile.sentenceRhythm}；${styleProfile.lexicalStyle}；${styleProfile.ending}。`
             ].join('\n');
 
             const userPrompt = [
@@ -1847,7 +2079,7 @@
                 `目标作者: ${targetAuthor}`,
                 `目标内容: ${targetMessage}`,
                 '',
-                '输出要求补充：语气要硬、论证要密，正文要有完整展开，避免短促敷衍。'
+                '补充要求：回复要像真人评论区发言，结构和节奏按内容自然展开，不必套固定模板。'
             ].join('\n');
 
             return {
@@ -1856,11 +2088,12 @@
             };
         }
 
-        buildAiAuthorPrompt(targetReply, replies, replyFloorMap, rootComment) {
+        buildAiAuthorPrompt(targetReply, replies, replyFloorMap, rootComment, promptStyle = DEFAULT_AI_PROMPT_STYLE) {
             const { contextText } = this.buildAiAnalysisContext(replies, replyFloorMap, rootComment);
             const authorContext = this.collectAuthorReplies(targetReply, replies, replyFloorMap);
             const authorName = authorContext.authorName || targetReply.member?.uname || '匿名用户';
             const targetReplies = authorContext.matchedReplies || [];
+            const selectedPromptStyle = this.normalizeAIPromptStyle(promptStyle);
 
             if (targetReplies.length === 0) {
                 throw new Error('未找到目标作者的可用回复，无法生成作者全集反对意见');
@@ -1872,17 +2105,55 @@
                 return `[${floorLabel}] 内容:${message || '[空内容]'}`;
             });
 
+            if (selectedPromptStyle === 'classic_structured') {
+                const systemPrompt = [
+                    '你是一个强硬、犀利、压迫感强的中文辩论写手。',
+                    '目标：只针对指定目标作者在当前楼层中的全部发言，生成一段统一反驳回复。',
+                    '其他作者发言只能用于理解上下文，不要逐条点名回复其他人。',
+                    '硬性要求：',
+                    '1) 直接输出可发布的中文成稿，不要输出分析过程，不要写标题。',
+                    '2) 开头直接切入反驳，不要先礼貌性承认对方观点。',
+                    '3) 必须综合该作者多条发言做整体反驳，覆盖其主要观点和重复论点。',
+                    '4) 可使用反问、对比、类比增强力度，但禁止人身攻击、辱骂、歧视、威胁。',
+                    '5) 结尾给出明确结论或行动主张，避免模糊收尾。',
+                    '6) 篇幅要充分展开，信息密度高，避免空话和套话。'
+                ].join('\n');
+
+                const userPrompt = [
+                    '以下是完整楼层上下文（含楼主与全部回复），供你理解前因后果：',
+                    contextText || '无',
+                    '',
+                    '请仅针对下面这个目标作者的全部发言生成反对意见：',
+                    `目标作者: ${authorName}`,
+                    `目标发言数量: ${targetReplies.length}`,
+                    '目标发言列表:',
+                    targetLines.join('\n'),
+                    '',
+                    '输出要求补充：语气要硬、论证要密，正文要有完整展开，避免短促敷衍。'
+                ].join('\n');
+
+                return {
+                    systemPrompt,
+                    userPrompt,
+                    authorName,
+                    targetReplies
+                };
+            }
+
+            const styleProfile = this.buildAiStyleProfile(selectedPromptStyle, 'author_all');
+
             const systemPrompt = [
-                '你是一个强硬、犀利、压迫感强的中文辩论写手。',
-                '目标：只针对指定目标作者在当前楼层中的全部发言，生成一段统一反驳回复。',
-                '其他作者发言只能用于理解上下文，不要逐条点名回复其他人。',
-                '硬性要求：',
-                '1) 直接输出可发布的中文成稿，不要输出分析过程，不要写标题。',
-                '2) 开头直接切入反驳，不要先礼貌性承认对方观点。',
-                '3) 必须综合该作者多条发言做整体反驳，覆盖其主要观点和重复论点。',
-                '4) 可使用反问、对比、类比增强力度，但禁止人身攻击、辱骂、歧视、威胁。',
-                '5) 结尾给出明确结论或行动主张，避免模糊收尾。',
-                '6) 篇幅要充分展开，信息密度高，避免空话和套话。'
+                '你是B站评论区里会讲人话的辩手，写作风格要像真实用户即时回复。',
+                '任务：只针对目标作者在当前楼层的全部发言，生成一段统一反驳。',
+                '输出规则：',
+                '1) 只输出可直接发布的正文，不要标题、不要分析过程，也不需要分点编号。',
+                '2) 优先整合该作者多条发言中的共同漏洞，不必逐条复述。',
+                '3) 口语化、通俗易懂，像评论区真人即时回复，避免公文腔和论文腔。',
+                '4) 反问、类比、对比可按需要自然使用，由你判断何时最有说服力。',
+                '5) 连接词和句式可自由发挥，重点是表达自然、逻辑清楚，不要生硬堆砌。',
+                '6) 结尾可给出明确判断或行动主张，让立场清晰。',
+                `7) 字数建议：${styleProfile.lengthHint}。`,
+                `本次风格：${styleProfile.styleName}。${styleProfile.tone}；${styleProfile.opening}；${styleProfile.progression}；${styleProfile.sentenceRhythm}；${styleProfile.lexicalStyle}；${styleProfile.ending}。`
             ].join('\n');
 
             const userPrompt = [
@@ -1895,7 +2166,7 @@
                 '目标发言列表:',
                 targetLines.join('\n'),
                 '',
-                '输出要求补充：语气要硬、论证要密，正文要有完整展开，避免短促敷衍。'
+                '补充要求：像真人在评论区连续回怼，结构按内容自由组织，避免生硬套模板。'
             ].join('\n');
 
             return {
@@ -2131,13 +2402,13 @@
             return aiText;
         }
 
-        async generateAIRebuttal(targetReply, replies, replyFloorMap, rootComment) {
-            const { systemPrompt, userPrompt } = this.buildAiPrompt(targetReply, replies, replyFloorMap, rootComment);
+        async generateAIRebuttal(targetReply, replies, replyFloorMap, rootComment, promptStyle = DEFAULT_AI_PROMPT_STYLE) {
+            const { systemPrompt, userPrompt } = this.buildAiPrompt(targetReply, replies, replyFloorMap, rootComment, promptStyle);
             return this.requestAIRebuttalText(systemPrompt, userPrompt);
         }
 
-        async generateAIAuthorRebuttal(targetReply, replies, replyFloorMap, rootComment) {
-            const { systemPrompt, userPrompt } = this.buildAiAuthorPrompt(targetReply, replies, replyFloorMap, rootComment);
+        async generateAIAuthorRebuttal(targetReply, replies, replyFloorMap, rootComment, promptStyle = DEFAULT_AI_PROMPT_STYLE) {
+            const { systemPrompt, userPrompt } = this.buildAiAuthorPrompt(targetReply, replies, replyFloorMap, rootComment, promptStyle);
             return this.requestAIRebuttalText(systemPrompt, userPrompt);
         }
 
@@ -2638,6 +2909,7 @@
             let aiRebuttalEnabled = Boolean(this.settings.enableAiRebuttal);
             let activeAIReplyId = '';
             let aiLoadingReplyId = '';
+            let isSelectingPromptStyle = false;
             let aiTaskMode = '';
             let aiTargetReply = null;
             let aiTargetAuthorName = '';
@@ -3087,9 +3359,21 @@
             const handleGenerateAiRebuttal = async (reply, mode = 'single') => {
                 const taskMode = mode === 'author_all' ? 'author_all' : 'single';
                 const selectedReplyId = this.getReplyId(reply);
-                if (!selectedReplyId || aiLoadingReplyId) {
+                if (!selectedReplyId || aiLoadingReplyId || isSelectingPromptStyle) {
                     return;
                 }
+
+                let selectedPromptStyle = null;
+                try {
+                    isSelectingPromptStyle = true;
+                    selectedPromptStyle = await this.promptAiStyleSelection(taskMode);
+                } finally {
+                    isSelectingPromptStyle = false;
+                }
+                if (!selectedPromptStyle) {
+                    return;
+                }
+                const promptStyleLabel = this.getAIPromptStyleLabel(selectedPromptStyle);
 
                 activeAIReplyId = selectedReplyId;
                 aiLoadingReplyId = selectedReplyId;
@@ -3106,8 +3390,8 @@
                 aiErrorText = '';
                 aiResultText = '';
                 aiTitle.textContent = taskMode === 'author_all'
-                    ? 'AI反对意见（作者全集分析中）'
-                    : 'AI反对意见（分析中）';
+                    ? `AI反对意见（作者全集分析中 | ${promptStyleLabel}）`
+                    : `AI反对意见（分析中 | ${promptStyleLabel}）`;
                 aiPanel.style.display = 'flex';
                 renderAIPanel();
                 positionAiPanel();
@@ -3115,19 +3399,19 @@
 
                 try {
                     const aiText = taskMode === 'author_all'
-                        ? await this.generateAIAuthorRebuttal(reply, replies, replyFloorMap, rootComment)
-                        : await this.generateAIRebuttal(reply, replies, replyFloorMap, rootComment);
+                        ? await this.generateAIAuthorRebuttal(reply, replies, replyFloorMap, rootComment, selectedPromptStyle)
+                        : await this.generateAIRebuttal(reply, replies, replyFloorMap, rootComment, selectedPromptStyle);
                     aiResultText = aiText;
                     aiErrorText = '';
                     aiTitle.textContent = taskMode === 'author_all'
-                        ? 'AI反对意见（作者全集）'
-                        : 'AI反对意见';
+                        ? `AI反对意见（作者全集 | ${promptStyleLabel}）`
+                        : `AI反对意见（${promptStyleLabel}）`;
                 } catch (error) {
                     aiErrorText = error?.message || '生成反对意见失败';
                     aiResultText = '';
                     aiTitle.textContent = taskMode === 'author_all'
-                        ? 'AI反对意见（作者全集失败）'
-                        : 'AI反对意见（失败）';
+                        ? `AI反对意见（作者全集失败 | ${promptStyleLabel}）`
+                        : `AI反对意见（失败 | ${promptStyleLabel}）`;
                     Utils.log('error', '生成AI反对意见失败', error);
                 } finally {
                     aiLoadingReplyId = '';
@@ -3963,6 +4247,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.4 已加载 - 新增AI反对意见与脚本菜单设置');
+    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.5 已加载 - 放宽自适应提示词限制并优化风格命名');
 
 })();
