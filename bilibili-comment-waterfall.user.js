@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    https://violentmonkey.github.io/
-// @version      2.5.3
+// @version      2.5.4
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
@@ -72,6 +72,7 @@
             enabled: false,
             lastReadAt: 0
         },
+        _shortUrlResolveCache: new Map(),
 
         isDebugLogEnabled() {
             const now = Date.now();
@@ -269,6 +270,224 @@
             return processedContent;
         },
 
+        normalizeVideoUrl(url) {
+            if (!url || typeof url !== 'string') return '';
+            return url.replace(/&amp;/gi, '&').trim();
+        },
+
+        sanitizeMatchedVideoUrl(url) {
+            let normalizedUrl = this.normalizeVideoUrl(url);
+            if (!normalizedUrl) return '';
+
+            // 去掉紧贴在链接末尾的表情文本与常见中英文标点
+            while (normalizedUrl) {
+                const next = normalizedUrl
+                    .replace(/\[[^\[\]\s]{1,24}\]$/u, '')
+                    .replace(/[，。！？、；：,.!?;:]+$/u, '')
+                    .replace(/[)\]}>）》】」』]+$/u, '');
+
+                if (next === normalizedUrl) break;
+                normalizedUrl = next;
+            }
+
+            return normalizedUrl;
+        },
+
+        getB23CandidateShortUrls(url) {
+            const normalizedUrl = this.normalizeVideoUrl(url);
+            if (!normalizedUrl) {
+                return [];
+            }
+
+            let parsedUrl;
+            try {
+                parsedUrl = new URL(normalizedUrl);
+            } catch (error) {
+                return [];
+            }
+
+            if (!/(^|\.)b23\.tv$/i.test(parsedUrl.hostname)) {
+                return [];
+            }
+
+            let rawPath = '';
+            try {
+                rawPath = decodeURIComponent(String(parsedUrl.pathname || ''));
+            } catch (error) {
+                rawPath = String(parsedUrl.pathname || '');
+            }
+            rawPath = rawPath.replace(/^\/+/, '');
+            if (!rawPath) {
+                return [];
+            }
+
+            const firstSegment = rawPath.split('/')[0] || '';
+            const tokenMatch = firstSegment.match(/^[A-Za-z0-9_-]+/);
+            if (!tokenMatch) {
+                return [];
+            }
+
+            const rawToken = tokenMatch[0];
+            const candidates = [];
+            const seen = new Set();
+            const minTokenLen = 5;
+            const maxProbeCount = 12;
+
+            const addCandidate = (token) => {
+                const safeToken = String(token || '').trim();
+                if (safeToken.length < minTokenLen) return;
+                if (seen.has(safeToken)) return;
+                seen.add(safeToken);
+                candidates.push(`${parsedUrl.protocol}//${parsedUrl.host}/${safeToken}`);
+            };
+
+            // 先尝试完整 token（兼容原始短链本身）
+            addCandidate(rawToken);
+
+            // 纯短码常见为 7 位；若后面粘了英文字符，这里优先截断到 7 位
+            if (rawToken.length > 7) {
+                addCandidate(rawToken.slice(0, 7));
+            }
+
+            // 再按长度递减尝试，兼容“链接后直接接任意字符”场景
+            for (let len = rawToken.length - 1; len >= minTokenLen && candidates.length < maxProbeCount; len--) {
+                addCandidate(rawToken.slice(0, len));
+            }
+
+            return candidates;
+        },
+
+        parseVideoInfoFromUrl(url) {
+            const normalizedUrl = this.sanitizeMatchedVideoUrl(url);
+            if (!normalizedUrl) return null;
+
+            const normalizeBvid = (bvid) => bvid.replace(/^bv/i, 'BV');
+            const avMatch = normalizedUrl.match(/(?:\/video\/|b23\.tv\/)av(\d+)/i)
+                || normalizedUrl.match(/[?&]aid=(\d+)/i);
+
+            if (avMatch) {
+                return {
+                    type: 'av',
+                    id: avMatch[1]
+                };
+            }
+
+            const bvMatch = normalizedUrl.match(/(?:\/video\/|b23\.tv\/)(BV[a-zA-Z0-9]{10})/i)
+                || normalizedUrl.match(/[?&]bvid=(BV[a-zA-Z0-9]{10})/i);
+
+            if (bvMatch) {
+                return {
+                    type: 'bv',
+                    id: normalizeBvid(bvMatch[1])
+                };
+            }
+
+            return null;
+        },
+
+        getCanonicalVideoMatchText(url, videoInfo = null) {
+            const normalizedUrl = this.sanitizeMatchedVideoUrl(url);
+            if (!normalizedUrl) {
+                return '';
+            }
+
+            const parsedInfo = videoInfo || this.parseVideoInfoFromUrl(normalizedUrl);
+            if (!parsedInfo) {
+                return normalizedUrl;
+            }
+
+            if (/^https?:\/\/(?:www\.)?b23\.tv\//i.test(normalizedUrl)) {
+                if (parsedInfo.type === 'av') {
+                    return normalizedUrl.replace(/^(https?:\/\/(?:www\.)?b23\.tv\/)av\d+.*/i, `$1av${parsedInfo.id}`);
+                }
+                if (parsedInfo.type === 'bv') {
+                    return normalizedUrl.replace(/^(https?:\/\/(?:www\.)?b23\.tv\/)BV[a-zA-Z0-9]+.*/i, `$1${parsedInfo.id}`);
+                }
+            }
+
+            if (/^https?:\/\/(?:www\.)?bilibili\.com\/video\//i.test(normalizedUrl)) {
+                if (parsedInfo.type === 'av') {
+                    return normalizedUrl.replace(/^(https?:\/\/(?:www\.)?bilibili\.com\/video\/)av\d+.*/i, `$1av${parsedInfo.id}`);
+                }
+                if (parsedInfo.type === 'bv') {
+                    return normalizedUrl.replace(/^(https?:\/\/(?:www\.)?bilibili\.com\/video\/)BV[a-zA-Z0-9]+.*/i, `$1${parsedInfo.id}`);
+                }
+            }
+
+            return normalizedUrl;
+        },
+
+        isB23ShortUrl(url) {
+            return this.getB23CandidateShortUrls(url).length > 0;
+        },
+
+        async resolveB23ShortUrl(url) {
+            const normalizedUrl = this.sanitizeMatchedVideoUrl(url);
+            if (!normalizedUrl) return null;
+
+            if (this._shortUrlResolveCache.has(normalizedUrl)) {
+                return this._shortUrlResolveCache.get(normalizedUrl);
+            }
+
+            const resolvePromise = new Promise((resolve) => {
+                if (typeof GM_xmlhttpRequest === 'function') {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: normalizedUrl,
+                        timeout: CONFIG.REQUEST_TIMEOUT,
+                        onload: (response) => {
+                            const finalUrl = String(response?.finalUrl || response?.responseURL || '').trim();
+                            resolve(finalUrl || null);
+                        },
+                        onerror: () => resolve(null),
+                        ontimeout: () => resolve(null)
+                    });
+                    return;
+                }
+
+                fetch(normalizedUrl, {
+                    method: 'GET',
+                    redirect: 'follow'
+                }).then((response) => {
+                    resolve(String(response?.url || '').trim() || null);
+                }).catch(() => {
+                    resolve(null);
+                });
+            });
+
+            this._shortUrlResolveCache.set(normalizedUrl, resolvePromise);
+            return resolvePromise;
+        },
+
+        async resolveB23ShortVideoInfo(url) {
+            const directVideoInfo = this.parseVideoInfoFromUrl(url);
+            if (directVideoInfo) {
+                return directVideoInfo;
+            }
+
+            if (!this.isB23ShortUrl(url)) {
+                return null;
+            }
+
+            const candidateUrls = this.getB23CandidateShortUrls(url);
+            for (const candidateUrl of candidateUrls) {
+                const finalUrl = await this.resolveB23ShortUrl(candidateUrl);
+                if (!finalUrl) {
+                    continue;
+                }
+
+                const resolvedVideoInfo = this.parseVideoInfoFromUrl(finalUrl);
+                if (resolvedVideoInfo) {
+                    return {
+                        ...resolvedVideoInfo,
+                        resolvedShortUrl: candidateUrl
+                    };
+                }
+            }
+
+            return null;
+        },
+
         // 获取视频标题
         async getVideoTitle(videoId, isAv = false) {
             try {
@@ -335,19 +554,56 @@
                 occupiedRanges.push({ start, end });
             };
 
-            // 优先匹配完整视频链接，保证短链如 https://b23.tv/BV... 作为整体处理
-            const videoUrlPattern = /https?:\/\/(?:www\.)?(?:b23\.tv\/(?:av\d+|BV[a-zA-Z0-9]+)|bilibili\.com\/video\/(?:av\d+|BV[a-zA-Z0-9]+)(?:\/?[^\s<>"']*)?)/gi;
+            // 优先匹配完整视频链接，b23 短链会在后续通过跳转补充解析
+            const videoUrlPattern = /https?:\/\/(?:www\.)?(?:b23\.tv\/[A-Za-z0-9_-]+(?:\/?[A-Za-z0-9\-._~:/?#@!$&()*+,;=%]*)?|bilibili\.com\/video\/(?:av\d+|BV[a-zA-Z0-9]{10})(?:\/?[A-Za-z0-9\-._~:/?#@!$&()*+,;=%]*)?)/gi;
             let match;
+            const unresolvedB23Links = [];
             while ((match = videoUrlPattern.exec(escapedContent)) !== null) {
-                const fullUrl = match[0];
-                const avMatch = fullUrl.match(/(?:\/video\/|b23\.tv\/)av(\d+)/i);
-                const bvMatch = fullUrl.match(/(?:\/video\/|b23\.tv\/)(BV[a-zA-Z0-9]+)/i);
+                const fullUrl = this.sanitizeMatchedVideoUrl(match[0]);
+                if (!fullUrl) continue;
 
-                if (avMatch) {
-                    addVideoMatch(fullUrl, 'av', avMatch[1], match.index);
-                } else if (bvMatch) {
-                    addVideoMatch(fullUrl, 'bv', normalizeBvid(bvMatch[1]), match.index);
+                const videoInfo = this.parseVideoInfoFromUrl(fullUrl);
+
+                if (videoInfo) {
+                    const canonicalMatch = this.getCanonicalVideoMatchText(fullUrl, videoInfo) || fullUrl;
+                    addVideoMatch(canonicalMatch, videoInfo.type, videoInfo.id, match.index);
+                } else if (this.isB23ShortUrl(fullUrl)) {
+                    unresolvedB23Links.push({
+                        fullUrl,
+                        index: match.index
+                    });
                 }
+            }
+
+            if (unresolvedB23Links.length > 0) {
+                const resolvedShortVideoMatches = await Promise.all(unresolvedB23Links.map(async ({ fullUrl, index }) => {
+                    const resolvedInfo = await this.resolveB23ShortVideoInfo(fullUrl);
+                    if (!resolvedInfo) {
+                        this.log('info', 'b23短链未解析为BV/av，回退为原链接展示', fullUrl);
+                        const fallbackCandidates = this.getB23CandidateShortUrls(fullUrl);
+                        const fallbackMatch = fallbackCandidates.find(item => /\/[A-Za-z0-9_-]{7}$/i.test(item))
+                            || fallbackCandidates[0]
+                            || fullUrl;
+                        // 兜底：短链无法解出 BV/av 时，仍按可点击链接处理，避免完全失效
+                        return {
+                            type: 'url',
+                            id: fallbackMatch,
+                            fullUrl: fallbackMatch,
+                            index
+                        };
+                    }
+                    return {
+                        type: resolvedInfo.type,
+                        id: resolvedInfo.id,
+                        fullUrl: resolvedInfo.resolvedShortUrl || fullUrl,
+                        index
+                    };
+                }));
+
+                resolvedShortVideoMatches.forEach((video) => {
+                    if (!video) return;
+                    addVideoMatch(video.fullUrl, video.type, video.id, video.index);
+                });
             }
 
             // 再匹配纯 av/BV 号
@@ -356,9 +612,9 @@
                 addVideoMatch(match[0], 'av', match[1], match.index);
             }
 
-            const bvPattern = /\b(BV[a-zA-Z0-9]+)\b/gi;
+            const bvPattern = /BV[a-zA-Z0-9]{10}/gi;
             while ((match = bvPattern.exec(escapedContent)) !== null) {
-                addVideoMatch(match[0], 'bv', normalizeBvid(match[1]), match.index);
+                addVideoMatch(match[0], 'bv', normalizeBvid(match[0]), match.index);
             }
 
             // 没有视频匹配时仅处理表情
@@ -383,6 +639,10 @@
 
             const titlePromiseCache = new Map();
             const videoData = await Promise.all(sortedMatches.map(video => {
+                if (video.type === 'url') {
+                    return Promise.resolve({ ...video, title: video.fullMatch });
+                }
+
                 const cacheKey = `${video.type}:${video.id}`;
                 if (!titlePromiseCache.has(cacheKey)) {
                     titlePromiseCache.set(cacheKey, this.getVideoTitle(video.id, video.type === 'av'));
@@ -393,7 +653,9 @@
             for (const video of videoData) {
                 const url = video.type === 'av'
                     ? `https://www.bilibili.com/video/av${video.id}/`
-                    : `https://www.bilibili.com/video/${video.id}/`;
+                    : video.type === 'bv'
+                        ? `https://www.bilibili.com/video/${video.id}/`
+                        : video.id;
 
                 const title = video.title || video.fullMatch;
                 const linkHtml = this.createVideoLinkHtml(url, title);
@@ -3447,7 +3709,7 @@
             const escapedContent = Utils.escapeHtml(originalContent);
             messageDiv.innerHTML = Utils.processEmoticons(escapedContent, replyEmoteData);
 
-            const hasVideoReference = /(?:https?:\/\/(?:www\.)?(?:b23\.tv\/|bilibili\.com\/video\/)|\bav\d+\b|\bBV[a-zA-Z0-9]+\b)/i.test(originalContent);
+            const hasVideoReference = /(?:https?:\/\/(?:www\.)?(?:b23\.tv\/|bilibili\.com\/video\/)|\bav\d+\b|BV[a-zA-Z0-9]{10})/i.test(originalContent);
             if (hasVideoReference) {
                 // 异步处理视频链接（完成后覆盖为完整内容）
                 Utils.processCommentContentEnhanced(originalContent, replyEmoteData).then(processedContent => {
@@ -3701,6 +3963,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.3 已加载 - 新增AI反对意见与脚本菜单设置');
+    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.4 已加载 - 新增AI反对意见与脚本菜单设置');
 
 })();
