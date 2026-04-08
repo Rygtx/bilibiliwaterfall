@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili评论展开助手
 // @namespace    https://violentmonkey.github.io/
-// @version      2.5.5
+// @version      2.5.6
 // @description  智能展开Bilibili评论回复，一键查看所有子评论，支持按热度和时间排序，完整支持B站表情符号显示，提供流畅的评论浏览体验
 // @author       Rygtx
 // @icon         https://www.bilibili.com/favicon.ico
@@ -78,6 +78,8 @@
             enabled: false,
             lastReadAt: 0
         },
+        _toastTimer: null,
+        _toastRemoveTimer: null,
         _shortUrlResolveCache: new Map(),
 
         isDebugLogEnabled() {
@@ -123,6 +125,101 @@
                 default:
                     console.log(prefix, message, ...args);
             }
+        },
+
+        getCookie(name) {
+            if (!name || typeof document === 'undefined') {
+                return '';
+            }
+
+            const cookieText = document.cookie || '';
+            if (!cookieText) {
+                return '';
+            }
+
+            const safeName = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const match = cookieText.match(new RegExp(`(?:^|;\\s*)${safeName}=([^;]*)`));
+            return match ? decodeURIComponent(match[1]) : '';
+        },
+
+        showToast(message, type = 'info', duration = 2600) {
+            if (typeof document === 'undefined' || !message) {
+                return;
+            }
+
+            const toastId = 'bili-comment-expand-toast';
+            let toast = document.getElementById(toastId);
+            if (!toast) {
+                toast = document.createElement('div');
+                toast.id = toastId;
+                document.body.appendChild(toast);
+            }
+
+            const palette = {
+                info: {
+                    background: 'rgba(25, 25, 25, 0.92)',
+                    border: 'rgba(0, 161, 214, 0.45)',
+                    color: '#e6f5ff'
+                },
+                warn: {
+                    background: 'rgba(48, 35, 12, 0.94)',
+                    border: 'rgba(255, 184, 108, 0.45)',
+                    color: '#ffd591'
+                },
+                error: {
+                    background: 'rgba(52, 18, 18, 0.96)',
+                    border: 'rgba(255, 120, 117, 0.45)',
+                    color: '#ffccc7'
+                }
+            };
+            const activePalette = palette[type] || palette.info;
+
+            toast.textContent = String(message);
+            toast.style.cssText = `
+                position: fixed;
+                left: 50%;
+                bottom: 28px;
+                transform: translateX(-50%);
+                z-index: 10050;
+                max-width: min(88vw, 520px);
+                padding: 10px 14px;
+                border-radius: 8px;
+                border: 1px solid ${activePalette.border};
+                background: ${activePalette.background};
+                color: ${activePalette.color};
+                font-size: 13px;
+                line-height: 1.5;
+                box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
+                pointer-events: none;
+                opacity: 1;
+                transition: opacity 0.2s ease;
+                white-space: pre-wrap;
+                word-break: break-word;
+            `;
+
+            if (this._toastTimer) {
+                clearTimeout(this._toastTimer);
+            }
+            if (this._toastRemoveTimer) {
+                clearTimeout(this._toastRemoveTimer);
+            }
+
+            this._toastTimer = setTimeout(() => {
+                toast.style.opacity = '0';
+                this._toastRemoveTimer = setTimeout(() => {
+                    if (toast.parentNode) {
+                        toast.remove();
+                    }
+                }, 220);
+            }, Math.max(1200, Number(duration) || 0));
+        },
+
+        getPageFetch() {
+            const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            if (pageWindow && typeof pageWindow.fetch === 'function') {
+                return pageWindow.fetch.bind(pageWindow);
+            }
+            return (...args) => fetch(...args);
         },
 
         formatTime(timestamp) {
@@ -735,8 +832,9 @@
                 try {
                     const controller = new AbortController();
                     const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+                    const pageFetch = this.getPageFetch();
 
-                    const response = await fetch(url, {
+                    const response = await pageFetch(url, {
                         ...options,
                         signal: controller.signal,
                         headers: {
@@ -826,10 +924,11 @@
         }
 
         async getCommentReplies(oid, rootRpid, page = 1, pageSize = CONFIG.REPLY_PAGE_SIZE) {
+            const canUseCache = !this.hasLoginSession();
             const cacheKey = this.getCacheKey('replies', oid, rootRpid, page, pageSize);
             const cached = this.cache.get(cacheKey);
 
-            if (this.isValidCache(cached)) {
+            if (canUseCache && this.isValidCache(cached)) {
                 Utils.log('info', `使用缓存数据: ${cacheKey}`);
                 return { ...cached.data, __fromCache: true };
             }
@@ -841,9 +940,15 @@
                 url.searchParams.set('root', rootRpid);
                 url.searchParams.set('ps', pageSize);
                 url.searchParams.set('pn', page);
+                if (!canUseCache) {
+                    url.searchParams.set('_ts', String(Date.now()));
+                }
 
                 Utils.log('info', `请求评论回复: ${url.toString()}`);
-                const response = await Utils.fetchWithRetry(url.toString());
+                const response = await Utils.fetchWithRetry(url.toString(), {
+                    credentials: 'include',
+                    cache: canUseCache ? 'default' : 'no-store'
+                });
                 const data = await response.json();
 
                 if (data.code !== 0) {
@@ -851,10 +956,12 @@
                 }
 
                 // 缓存结果
-                this.cache.set(cacheKey, {
-                    data: data.data,
-                    timestamp: Date.now()
-                });
+                if (canUseCache) {
+                    this.cache.set(cacheKey, {
+                        data: data.data,
+                        timestamp: Date.now()
+                    });
+                }
 
                 Utils.log('info', `成功获取评论回复: ${data.data?.replies?.length || 0} 条`);
                 return { ...data.data, __fromCache: false };
@@ -866,9 +973,10 @@
         }
 
         async getAllReplies(oid, rootRpid, maxPages = CONFIG.REPLY_MAX_PAGES, pageSize = CONFIG.REPLY_PAGE_SIZE, concurrency = CONFIG.REPLY_FETCH_CONCURRENCY) {
+            const canUseCache = !this.hasLoginSession();
             const allRepliesCacheKey = this.getCacheKey('replies_all', oid, rootRpid, maxPages, pageSize);
             const allRepliesCached = this.cache.get(allRepliesCacheKey);
-            if (this.isValidCache(allRepliesCached)) {
+            if (canUseCache && this.isValidCache(allRepliesCached)) {
                 Utils.log('info', `使用完整回复缓存: ${allRepliesCacheKey}`);
                 return allRepliesCached.data;
             }
@@ -926,13 +1034,109 @@
                 Utils.log('warn', `回复抓取触发页数上限: maxPages=${maxPages}, pageSize=${pageSize}, 已获取=${allReplies.length}`);
             }
 
-            this.cache.set(allRepliesCacheKey, {
-                data: allReplies,
-                timestamp: Date.now()
-            });
+            if (canUseCache) {
+                this.cache.set(allRepliesCacheKey, {
+                    data: allReplies,
+                    timestamp: Date.now()
+                });
+            }
 
             Utils.log('info', `总共获取到 ${allReplies.length} 条回复 (并发=${safeConcurrency})`);
             return allReplies;
+        }
+
+        getCsrfToken() {
+            return Utils.getCookie('bili_jct');
+        }
+
+        hasLoginSession() {
+            return Boolean(this.getCsrfToken());
+        }
+
+        buildReplyActionError(data, fallbackMessage) {
+            const code = Number(data?.code ?? NaN);
+            const message = typeof data?.message === 'string' && data.message.trim()
+                ? data.message.trim()
+                : fallbackMessage;
+
+            if (code === -101) {
+                return '请先登录 B站账号后再点赞';
+            }
+
+            if (code === -111) {
+                return '登录状态已过期，请刷新页面后重试';
+            }
+
+            if (Number.isFinite(code) && code !== 0) {
+                return `${message} (code: ${code})`;
+            }
+
+            return message;
+        }
+
+        async setReplyLike(oid, rpid, liked) {
+            const safeOid = String(oid || '').trim();
+            const safeRpid = String(rpid || '').trim();
+            const csrf = this.getCsrfToken();
+            const actionLabel = liked ? '点赞' : '取消点赞';
+
+            if (!safeOid || !safeRpid) {
+                throw new Error(`${actionLabel}失败：评论参数不完整`);
+            }
+
+            if (!csrf) {
+                throw new Error('请先登录 B站账号后再点赞');
+            }
+
+            const requestBody = new URLSearchParams();
+            requestBody.set('oid', safeOid);
+            requestBody.set('type', String(CONFIG.COMMENT_TYPE));
+            requestBody.set('rpid', safeRpid);
+            requestBody.set('action', liked ? '1' : '0');
+            requestBody.set('csrf', csrf);
+            requestBody.set('csrf_token', csrf);
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
+            const pageFetch = Utils.getPageFetch();
+
+            try {
+                const response = await pageFetch(`${CONFIG.API_BASE}/x/v2/reply/action`, {
+                    method: 'POST',
+                    credentials: 'include',
+                    signal: controller.signal,
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Accept': 'application/json, text/plain, */*'
+                    },
+                    body: requestBody.toString()
+                });
+
+                const responseText = await response.text();
+                if (!response.ok) {
+                    throw new Error(`${actionLabel}失败：HTTP ${response.status}`);
+                }
+
+                let data = null;
+                try {
+                    data = JSON.parse(responseText || '{}');
+                } catch (error) {
+                    throw new Error(`${actionLabel}失败：接口返回了非 JSON 数据`);
+                }
+
+                if (Number(data?.code) !== 0) {
+                    throw new Error(this.buildReplyActionError(data, `${actionLabel}失败`));
+                }
+
+                return data?.data || null;
+            } catch (error) {
+                if (error?.name === 'AbortError') {
+                    throw new Error(`${actionLabel}超时，请稍后重试`);
+                }
+                throw error;
+            } finally {
+                clearTimeout(timeoutId);
+            }
         }
 
         clearCache() {
@@ -2437,6 +2641,7 @@
                     : '';
                 const rootComment = {
                     rpid: String(commentInfo.rootId),
+                    oid: String(commentInfo.oid),
                     member: {
                         uname: rootThreadData?.member?.uname || '楼主',
                         mid: rootThreadData?.member?.mid || rootThreadData?.mid || '',
@@ -2916,6 +3121,7 @@
             let aiTargetAuthorReplies = [];
             let aiResultText = '';
             let aiErrorText = '';
+            const pendingLikeReplyIds = new Set();
             const panelGap = 16;
             const panelMargin = 28;
             const panelEdgeOffset = 24;
@@ -3281,6 +3487,8 @@
                     replyFloorMap,
                     handleViewConversation,
                     activeConversationReplyId,
+                    pendingLikeReplyIds,
+                    handleToggleReplyLike,
                     aiRebuttalEnabled ? handleGenerateAiRebuttal : null,
                     activeAIReplyId,
                     aiLoadingReplyId,
@@ -3309,6 +3517,40 @@
                 aiTitle.textContent = 'AI反对意见';
                 aiBody.innerHTML = '';
                 renderReplies();
+            };
+
+            const handleToggleReplyLike = async (reply) => {
+                const replyId = this.getReplyId(reply);
+                if (!replyId || pendingLikeReplyIds.has(replyId)) {
+                    return;
+                }
+
+                if (!this.commentAPI.hasLoginSession()) {
+                    Utils.showToast('请先登录 B站账号后再点赞', 'warn');
+                    return;
+                }
+
+                const replyOid = String(reply?.oid || rootComment?.oid || '').trim();
+                const nextLiked = !this.isReplyLiked(reply);
+                const actionLabel = nextLiked ? '点赞' : '取消点赞';
+                pendingLikeReplyIds.add(replyId);
+                renderReplies();
+
+                try {
+                    await this.commentAPI.setReplyLike(replyOid, replyId, nextLiked);
+                    this.applyReplyLikeMutationResult(reply, nextLiked);
+
+                    Utils.log('info', `${actionLabel}成功`, {
+                        oid: replyOid,
+                        rpid: replyId
+                    });
+                } catch (error) {
+                    Utils.log('error', '回复点赞操作失败', error);
+                    Utils.showToast(error?.message || `${actionLabel}失败，请稍后重试`, 'error');
+                } finally {
+                    pendingLikeReplyIds.delete(replyId);
+                    renderReplies();
+                }
             };
 
             const toggleConversationPanelMaximize = () => {
@@ -3598,6 +3840,60 @@
             return Boolean(parentId && parentId !== rootId && parentId !== replyId);
         }
 
+        normalizeReplyActionState(value) {
+            if (value === undefined || value === null) {
+                return null;
+            }
+
+            if (typeof value === 'string' && !value.trim()) {
+                return null;
+            }
+
+            const numericValue = Number(value);
+            if (!Number.isFinite(numericValue)) {
+                return null;
+            }
+
+            return Math.trunc(numericValue);
+        }
+
+        getReplyActionState(reply) {
+            if (!reply || typeof reply !== 'object') {
+                return null;
+            }
+
+            // 当前登录用户的点赞状态看 action；up_action.like 表示 UP 主点赞，不能混用。
+            return this.normalizeReplyActionState(reply.action);
+        }
+
+        isReplyLiked(reply) {
+            return this.getReplyActionState(reply) === 1;
+        }
+
+        normalizeReplyLikeCount(value) {
+            const numericValue = Number(value);
+            if (!Number.isFinite(numericValue)) {
+                return 0;
+            }
+
+            return Math.max(0, Math.trunc(numericValue));
+        }
+
+        getNextReplyLikeCount(reply, liked) {
+            const currentLikeCount = this.normalizeReplyLikeCount(reply?.like);
+            const nextLikeCount = currentLikeCount + (liked ? 1 : -1);
+            return Math.max(0, nextLikeCount);
+        }
+
+        applyReplyLikeMutationResult(reply, liked) {
+            if (!reply || typeof reply !== 'object') {
+                return;
+            }
+
+            reply.action = liked ? 1 : 0;
+            reply.like = this.getNextReplyLikeCount(reply, liked);
+        }
+
         buildReplyIndex(replies) {
             const replyIndex = new Map();
             replies.forEach(reply => {
@@ -3792,6 +4088,8 @@
             replyFloorMap = new Map(),
             onViewConversation = null,
             activeConversationReplyId = '',
+            pendingLikeReplyIds = null,
+            onToggleReplyLike = null,
             onGenerateAiRebuttal = null,
             activeAIReplyId = '',
             aiLoadingReplyId = '',
@@ -3820,6 +4118,8 @@
                     floorInfo,
                     onViewConversation,
                     activeConversationReplyId,
+                    pendingLikeReplyIds,
+                    onToggleReplyLike,
                     onGenerateAiRebuttal,
                     activeAIReplyId,
                     aiLoadingReplyId,
@@ -3834,6 +4134,8 @@
             floorInfo = null,
             onViewConversation = null,
             activeConversationReplyId = '',
+            pendingLikeReplyIds = null,
+            onToggleReplyLike = null,
             onGenerateAiRebuttal = null,
             activeAIReplyId = '',
             aiLoadingReplyId = '',
@@ -3857,6 +4159,8 @@
             const isSingleAiLoading = isAiLoading && activeAITaskMode === 'single';
             const isAuthorAiActive = isAiActive && activeAITaskMode === 'author_all';
             const isAuthorAiLoading = isAiLoading && activeAITaskMode === 'author_all';
+            const isLiked = this.isReplyLiked(reply);
+            const isLikePending = Boolean(pendingLikeReplyIds instanceof Set && replyId && pendingLikeReplyIds.has(replyId));
             if (activeConversationReplyId && replyId === activeConversationReplyId) {
                 replyDiv.style.boxShadow = 'inset 3px 0 0 #00a1d6';
                 replyDiv.style.background = '#252525';
@@ -4016,29 +4320,68 @@
                 color: #9499a0;
             `;
 
-            const likeSpan = document.createElement('span');
-            likeSpan.style.cssText = `
+            const likeButton = document.createElement('button');
+            likeButton.type = 'button';
+            likeButton.style.cssText = `
                 display: flex;
                 align-items: center;
-                gap: 4px;
-                cursor: pointer;
+                gap: 6px;
                 padding: 4px 8px;
                 border-radius: 4px;
+                border: 1px solid transparent;
                 transition: all 0.2s ease;
+                font-size: 12px;
+                line-height: 1;
+                cursor: pointer;
             `;
-            likeSpan.innerHTML = `👍 ${Utils.formatNumber(reply.like || 0)}`;
+            likeButton.setAttribute('aria-pressed', isLiked ? 'true' : 'false');
+            likeButton.textContent = `${isLikePending ? '处理中' : '👍'} ${Utils.formatNumber(Math.max(0, Number(reply.like || 0)))}`;
 
-            // 点赞按钮悬停效果
-            likeSpan.onmouseover = () => {
-                likeSpan.style.background = '#3a3a3a';
-                likeSpan.style.color = '#00a1d6';
-            };
-            likeSpan.onmouseout = () => {
-                likeSpan.style.background = 'transparent';
-                likeSpan.style.color = '#9499a0';
+            const applyLikeButtonStyles = (hovered = false) => {
+                if (isLikePending) {
+                    likeButton.style.background = '#2d2d2d';
+                    likeButton.style.borderColor = '#4a4a4a';
+                    likeButton.style.color = '#c9ccd1';
+                    likeButton.style.cursor = 'default';
+                    likeButton.style.opacity = '0.75';
+                    return;
+                }
+
+                if (isLiked) {
+                    likeButton.style.background = hovered ? 'rgba(0, 161, 214, 0.2)' : 'rgba(0, 161, 214, 0.12)';
+                    likeButton.style.borderColor = hovered ? '#40a9ff' : 'rgba(0, 161, 214, 0.55)';
+                    likeButton.style.color = hovered ? '#78c6ff' : '#40a9ff';
+                    likeButton.style.opacity = '1';
+                    return;
+                }
+
+                likeButton.style.background = hovered ? '#3a3a3a' : 'transparent';
+                likeButton.style.borderColor = hovered ? '#00a1d6' : 'transparent';
+                likeButton.style.color = hovered ? '#00a1d6' : '#9499a0';
+                likeButton.style.opacity = '1';
             };
 
-            actions.appendChild(likeSpan);
+            applyLikeButtonStyles(false);
+            likeButton.title = isLikePending
+                ? '正在提交点赞请求'
+                : (isLiked ? '点击取消点赞' : '点击点赞');
+
+            likeButton.onmouseover = () => {
+                applyLikeButtonStyles(true);
+            };
+            likeButton.onmouseout = () => {
+                applyLikeButtonStyles(false);
+            };
+            likeButton.onclick = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (isLikePending || typeof onToggleReplyLike !== 'function') {
+                    return;
+                }
+                onToggleReplyLike(reply);
+            };
+
+            actions.appendChild(likeButton);
 
             if (this.isReplyToAnotherComment(reply) && typeof onViewConversation === 'function') {
                 const conversationBtn = document.createElement('button');
@@ -4247,6 +4590,6 @@
         setTimeout(initializeScript, 1000);
     }
 
-    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.5 已加载 - 放宽自适应提示词限制并优化风格命名');
+    Utils.log('info', 'Bilibili评论展开助手脚本 v2.5.6 已加载 - 完善楼中楼回复点赞交互');
 
 })();
